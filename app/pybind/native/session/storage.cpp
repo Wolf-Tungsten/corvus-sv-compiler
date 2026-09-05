@@ -72,6 +72,7 @@ namespace wolvrix::app::pybind
     {
         const std::string ownedKey(key);
         return session.designs.find(ownedKey) != session.designs.end() ||
+               session.grhsimModels.find(ownedKey) != session.grhsimModels.end() ||
                session.nativeValues.find(ownedKey) != session.nativeValues.end() ||
                session.pythonValues.find(ownedKey) != session.pythonValues.end();
     }
@@ -82,6 +83,10 @@ namespace wolvrix::app::pybind
         if (session.designs.find(ownedKey) != session.designs.end())
         {
             return "design";
+        }
+        if (session.grhsimModels.find(ownedKey) != session.grhsimModels.end())
+        {
+            return "grhsim";
         }
         if (session.nativeValues.find(ownedKey) != session.nativeValues.end())
         {
@@ -100,6 +105,10 @@ namespace wolvrix::app::pybind
         if (session.designs.find(ownedKey) != session.designs.end())
         {
             return "design";
+        }
+        if (session.grhsimModels.find(ownedKey) != session.grhsimModels.end())
+        {
+            return "grhsim-model";
         }
         if (auto it = session.nativeValues.find(ownedKey); it != session.nativeValues.end())
         {
@@ -135,6 +144,14 @@ namespace wolvrix::app::pybind
         return &it->second.design;
     }
 
+    wolvrix::lib::grhsim::GrhSimModel *sessionGrhSimModel(SessionHandle &session,
+                                                          std::string_view key)
+    {
+        const std::string ownedKey(key);
+        auto it = session.grhsimModels.find(ownedKey);
+        return it == session.grhsimModels.end() ? nullptr : it->second.get();
+    }
+
     bool ensureSessionInsertable(const SessionHandle &session,
                                  std::string_view key,
                                  bool replace,
@@ -157,6 +174,7 @@ namespace wolvrix::app::pybind
     {
         const std::string ownedKey(key);
         session.designs.erase(ownedKey);
+        session.grhsimModels.erase(ownedKey);
         session.nativeValues.erase(ownedKey);
         session.pythonValues.erase(ownedKey);
     }

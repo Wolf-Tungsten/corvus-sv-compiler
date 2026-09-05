@@ -5,6 +5,7 @@
 
 #include "core/grh.hpp"
 #include "core/transform.hpp"
+#include "grhsim/ir/model.hpp"
 
 #include <memory>
 #include <string>
@@ -70,12 +71,14 @@ namespace wolvrix::app::pybind
     struct SessionHandle
     {
         std::unordered_map<std::string, DesignHandle> designs;
+        std::unordered_map<std::string, std::unique_ptr<wolvrix::lib::grhsim::GrhSimModel>> grhsimModels;
         wolvrix::lib::transform::SessionStore nativeValues;
         std::unordered_map<std::string, PythonSessionValue> pythonValues;
 
         void clear()
         {
             designs.clear();
+            grhsimModels.clear();
             nativeValues.clear();
             pythonValues.clear();
         }

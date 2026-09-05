@@ -116,6 +116,13 @@ set(WOLVRIX_LIB_SOURCES
     lib/core/store.cpp
     lib/core/ingest.cpp
     lib/core/transform.cpp
+    lib/grhsim/ir/model.cpp
+    lib/grhsim/ir/verifier.cpp
+    lib/grhsim/dialect/registry.cpp
+    lib/grhsim/dialect/core.cpp
+    lib/grhsim/pass/pass.cpp
+    lib/grhsim/convert/grh_to_grhsim.cpp
+    lib/grhsim/io/json.cpp
     lib/transform/activity_schedule.cpp
     lib/transform/demo_stats.cpp
     lib/transform/const_fold.cpp
@@ -321,6 +328,23 @@ target_link_libraries(grh-clone-tests
 )
 
 register_test_exe(grh-clone-tests)
+
+# GrhSIM IR foundation
+add_executable(grhsim-ir-tests
+    tests/grhsim/test_grhsim_ir.cpp
+)
+
+target_link_libraries(grhsim-ir-tests
+    PRIVATE
+        wolvrix-lib
+)
+
+target_compile_definitions(grhsim-ir-tests
+    PRIVATE
+        WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR="${WOLF_SV_TEST_ARTIFACT_DIR}/grhsim"
+)
+
+register_test_exe(grhsim-ir-tests)
 
 # core: toposort
 add_executable(core-toposort
