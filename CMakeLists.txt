@@ -123,6 +123,7 @@ set(WOLVRIX_LIB_SOURCES
     lib/grhsim/dialect/core.cpp
     lib/grhsim/dialect/cpu.cpp
     lib/grhsim/pass/pass.cpp
+    lib/grhsim/pass/reg_to_mem.cpp
     lib/grhsim/backend/cpu.cpp
     lib/grhsim/backend/cpu_partition.cpp
     lib/grhsim/backend/cpu_layout.cpp
@@ -354,6 +355,11 @@ target_compile_definitions(grhsim-ir-tests
 register_test_exe(grhsim-ir-tests)
 
 add_executable(grhsim-cpu-mapping-tests tests/grhsim/test_cpu_mapping.cpp)
+add_executable(grhsim-reg-to-mem-tests tests/grhsim/test_reg_to_mem.cpp tests/grhsim/test_reg_to_mem_semantics.cpp)
+target_link_libraries(grhsim-reg-to-mem-tests PRIVATE wolvrix-lib)
+target_compile_definitions(grhsim-reg-to-mem-tests PRIVATE
+    WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR="${WOLF_SV_TEST_ARTIFACT_DIR}/grhsim")
+register_test_exe(grhsim-reg-to-mem-tests)
 target_link_libraries(grhsim-cpu-mapping-tests PRIVATE wolvrix-lib)
 register_test_exe(grhsim-cpu-mapping-tests)
 add_executable(grhsim-cpu-schedule-tests tests/grhsim/test_cpu_schedule.cpp tests/grhsim/test_cpu_schedule_trace.cpp)

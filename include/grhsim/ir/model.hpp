@@ -546,6 +546,16 @@ namespace wolvrix::lib::grhsim
                           std::span<const ObjectRef> objectRefs = {},
                           std::span<const Parameter> parameters = {},
                           std::string_view name = {}, OriginId origin = {});
+        // Keep the operation ID/name/origin; spans must not alias this model's pools.
+        void replaceOperation(OpId id, std::string_view opType,
+                              std::span<const ValueId> operands,
+                              std::span<const ValueId> results,
+                              std::span<const ObjectRef> objectRefs = {},
+                              std::span<const Parameter> parameters = {});
+        // Masks include unused slot zero. Removed results must have no retained users.
+        // Rebuilds dense IDs/pools and drops mappings; the pass manager commits revision.
+        void compact(std::span<const uint8_t> removeOps,
+                     std::span<const uint8_t> removeStates);
         void addInit(StateId state, std::span<const InitStep> steps,
                      std::span<const Parameter> stepParameters);
         void addMapping(std::string_view backend, std::string_view schema, bool complete,

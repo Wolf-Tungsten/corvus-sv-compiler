@@ -381,6 +381,110 @@ namespace wolvrix::lib::grhsim
             state, Range{stepBase, static_cast<uint32_t>(steps.size())}});
     }
 
+    void GrhSimModel::replaceOperation(OpId id, std::string_view opType,
+                                       std::span<const ValueId> operands,
+                                       std::span<const ValueId> results,
+                                       std::span<const ObjectRef> objectRefs,
+                                       std::span<const Parameter> parameters)
+    {
+        if (id.generation != 0 || !id.index || id.index > operations_.size())
+            throw std::out_of_range("replaceOperation ID is invalid");
+        SimOp replacement = operations_[id.index - 1];
+        replacement.opType = intern(opType);
+        replacement.operands = appendRange(operandPool_, operands);
+        replacement.results = appendRange(resultPool_, results);
+        replacement.objectRefs = appendRange(objectRefPool_, objectRefs);
+        replacement.parameters = appendRange(parameterPool_, parameters);
+        operations_[id.index - 1] = replacement;
+    }
+
+    void GrhSimModel::compact(std::span<const uint8_t> removeOps,
+                              std::span<const uint8_t> removeStates)
+    {
+        if (removeOps.size() != operations_.size() + 1 || removeStates.size() != states_.size() + 1)
+            throw std::invalid_argument("compact masks must include slot zero and every entity");
+        std::vector<ValueId> valueMap(values_.size() + 1);
+        std::vector<StateId> stateMap(states_.size() + 1);
+        std::vector<uint8_t> liveValues(values_.size() + 1);
+        for (const auto &op : operations_)
+            if (!removeOps[op.id.index])
+                for (auto value : results(op)) liveValues.at(value.index) = 1;
+        std::vector<SimValue> newValues;
+        for (auto value : values_)
+        {
+            if (!liveValues[value.id.index]) continue;
+            const auto old = value.id;
+            value.id = nextId<ValueId>(newValues.size(), "compact values");
+            valueMap[old.index] = value.id;
+            newValues.push_back(value);
+        }
+        std::vector<StateObject> newStates;
+        for (auto state : states_)
+        {
+            if (removeStates[state.id.index]) continue;
+            const auto old = state.id;
+            state.id = nextId<StateId>(newStates.size(), "compact states");
+            stateMap[old.index] = state.id;
+            newStates.push_back(state);
+        }
+        std::vector<SimOp> newOps;
+        std::vector<ValueId> newOperands, newResults;
+        std::vector<ObjectRef> newRefs;
+        std::vector<Parameter> newParameters;
+        const auto remapValues = [&](std::span<const ValueId> source, std::vector<ValueId> &pool) {
+            Range range{static_cast<uint32_t>(pool.size()), static_cast<uint32_t>(source.size())};
+            for (auto value : source)
+            {
+                if (value.generation != 0 || !valueMap.at(value.index).valid())
+                    throw std::invalid_argument("compact would remove a retained value's producer");
+                pool.push_back(valueMap[value.index]);
+            }
+            return range;
+        };
+        for (auto op : operations_)
+        {
+            if (removeOps[op.id.index]) continue;
+            const auto refs = objectRefs(op);
+            const auto params = parameters(op);
+            op.operands = remapValues(operands(op), newOperands);
+            op.results = remapValues(results(op), newResults);
+            op.objectRefs = {static_cast<uint32_t>(newRefs.size()), static_cast<uint32_t>(refs.size())};
+            for (auto ref : refs)
+            {
+                if (ref.kind == ObjectKind::State)
+                {
+                    if (ref.generation != 0 || !stateMap.at(ref.index).valid())
+                        throw std::invalid_argument("compact would remove a referenced state");
+                    ref = ObjectRef::state(stateMap[ref.index]);
+                }
+                newRefs.push_back(ref);
+            }
+            op.parameters = appendRange(newParameters, params);
+            op.id = nextId<OpId>(newOps.size(), "compact operations");
+            newOps.push_back(op);
+        }
+        std::vector<InitRecord> newInits;
+        std::vector<InitStep> newSteps;
+        std::vector<Parameter> newInitParameters;
+        for (const auto &record : initRecords_)
+        {
+            if (removeStates[record.state.index]) continue;
+            const auto source = steps(record);
+            Range range{static_cast<uint32_t>(newSteps.size()), static_cast<uint32_t>(source.size())};
+            for (auto step : source)
+            {
+                step.parameters = appendRange(newInitParameters, parameters(step));
+                newSteps.push_back(step);
+            }
+            newInits.push_back({stateMap[record.state.index], range});
+        }
+        values_.swap(newValues); states_.swap(newStates); operations_.swap(newOps);
+        operandPool_.swap(newOperands); resultPool_.swap(newResults);
+        objectRefPool_.swap(newRefs); parameterPool_.swap(newParameters);
+        initRecords_.swap(newInits); initSteps_.swap(newSteps); initParameterPool_.swap(newInitParameters);
+        mappings_.clear(); mappingParameterPool_.clear();
+    }
+
     void GrhSimModel::addMapping(std::string_view backend, std::string_view schema,
                                  bool complete, std::span<const Parameter> parameters)
     {
