@@ -1,11 +1,11 @@
 # GrhSIM Core Dialect
 
 本文定义 GrhSIM `core` 方言，以及 GRH IR 到该方言的转换边界。[GrhSIM IR Overview](../overview.md)
-定义 `SimModel`、方言和后端映射之间的关系及执行语义。
+定义 `GrhSimModel`、方言和后端映射之间的关系及执行语义。
 
 ## 1. 定位
 
-`core` 是 GRH IR 到 `SimModel` 的后端无关承接层，不是面向某个后端的最小执行原语集。
+`core` 是 GRH IR 到 `GrhSimModel` 的后端无关承接层，不是面向某个后端的最小执行原语集。
 转换的首要目标是保留 GRH 中已经明确的语义结构：
 
 - graph input/output 分别成为 `I`/`O` 对象；
@@ -21,10 +21,6 @@ DPI call 不能按参数方向拆成多个调用或写回 op，system task 也�
 
 ## 2. 类型
 
-### 2.1 数据类型
-
-Core 数据类型为：
-
 ```text
 core.logic<width, signed, domain>
 core.real
@@ -32,40 +28,28 @@ core.string
 core.array<element_type, count>
 ```
 
-`core.logic` 表示固定位宽逻辑值：`width` 必须大于零，`signed` 表示算术解释是否有符号，
-`domain` 为 `2-state` 或 `4-state`。`core.real` 和 `core.string` 分别直接承接 GRH 的 `Real`
-和 `String`，没有 `width`、`signed` 或 `domain` 参数。`core.array` 是定长同类型序列；
-`count` 必须非负。
+- `core.logic` 表示固定位宽逻辑值：`width` 必须大于零，`signed` 表示算术解释是否有符号，
+  `domain` 为 `2-state` 或 `4-state`；
+- `core.real` 和 `core.string` 分别直接承接 GRH 的 `Real` 和 `String`，没有 `width`、
+  `signed` 或 `domain` 参数；
+- `core.array` 是定长同类型序列，`count` 必须非负。
+
+这四个类型同时用于 `I`、`O`、graph value 和 `S` 对象：状态的类型就是它保存的内容的
+类型。寄存器、锁存器、memory 和边沿历史的区别体现在读写状态的 op 上（见第 5、6 节），
+不由状态的类型区分。core 为全部四个类型定义 `InitSpec`（见第 2.1 节）。方言扩展可以
+增加其他类型，但不能改变已有 core 类型的含义。
 
 GRH 数据类型到 core 的转换是一一对应的：`Logic` 转换为 `core.logic`，`Real` 转换为
 `core.real`，`String` 转换为 `core.string`。GRH 已经扁平化的 packed array、struct 和 union
 继续表示为一个 `core.logic`，转换不得恢复出 `core.array` 或其他聚合类型。
 
-`InitSpec` 的 `core.init.const` 步骤使用与类型对应的值：`core.logic` 使用等宽的 2-state 或
-4-state logic 值，`core.real` 使用实数值，`core.string` 使用字符串值，`core.array` 使用恰好
-包含 `count` 个元素的序列。
+`core.init.const` 步骤中的 `value` 按状态内容的类型书写：`core.logic` 用等宽的 2-state 或
+4-state logic 值，`core.real` 用实数值，`core.string` 用字符串值，`core.array` 用恰好包含
+`count` 个元素的序列。
 
-`I`、`O` 和 graph value 使用数据类型。方言扩展可以增加其他数据类型，但不能改变已有 core
-类型的含义。
+### 2.1 初始化描述 `InitSpec`
 
-### 2.2 状态类型
-
-`S` 对象使用以下状态类型：
-
-```text
-core.state.register<T>
-core.state.latch<T>
-core.state.memory<T, rows>
-core.state.eventHistory<T>
-```
-
-- `register<T>` 和 `latch<T>` 保存一个 `T`；
-- `memory<T, rows>` 保存 `rows` 个按零起始地址索引的 `T`，`rows` 必须大于零；
-- `eventHistory<T>` 保存一个 event operand 的上一次取值。
-
-### 2.3 初始化描述 `InitSpec`
-
-core 方言为上述状态类型定义 `InitSpec`：一个**非空**的初始化步骤序列，按序应用，后者覆盖
+core 方言为全部四个类型定义 `InitSpec`：一个**非空**的初始化步骤序列，按序应用，后者覆盖
 前者：
 
 ```text
@@ -74,27 +58,26 @@ InitSpec = InitStep[]
 InitStep =
   core.init.const    { value }                          // 全量赋值
   core.init.random   { seed: Integer? }                 // 对应 $random / $random(seed)
-  core.init.readmem  { file, format: hex|bin, start?, count? }  // 仅 memory
-  core.init.fill     { value 或 random, start?, count? }          // 仅 memory
+  core.init.readmem  { file, format: hex|bin, start?, count? }  // 仅 core.array
+  core.init.fill     { value 或 random, start?, count? }          // 仅 core.array
 ```
 
-- `core.init.const` 适用于所有状态类型：`register<T>`、`latch<T>` 和 `eventHistory<T>` 的
-  `value` 是一个 `T` 值，`memory<T, rows>` 的 `value` 是恰好包含 `rows` 个 `T` 值的序列。
-- `core.init.random` 要求 `T` 为 `core.logic`，对整个状态赋予随机值；`seed` 缺省时对应无参
-  `$random`。
-- `core.init.readmem` 对应 `$readmemh`/`$readmemb`：`file` 为数据文件路径，`start` 缺省为 0，
-  `count` 缺省为从 `start` 读到末尾。
-- `core.init.fill` 对应一段地址的重复赋值：`value` 为静态 `T` 值，`random` 表示每行独立采样
-  `$random`；`start` 缺省为 0，`count` 缺省为覆盖到末尾。
+- `core.init.const` 适用于所有类型：`value` 是一个目标状态类型的值。
+- `core.init.random` 仅适用于 `core.logic` 状态，对整个状态赋予随机值；`seed` 缺省时对应
+  无参 `$random`。
+- `core.init.readmem` 仅适用于 `core.array` 状态，对应 `$readmemh`/`$readmemb`：`file` 为
+  数据文件路径，`start` 缺省为 0，`count` 缺省为从 `start` 读到末尾。
+- `core.init.fill` 仅适用于 `core.array` 状态，对应一段地址的重复赋值：`value` 为静态元素
+  值，`random` 表示每行独立采样 `$random`；`start` 缺省为 0，`count` 缺省为覆盖到末尾。
 
-`register<T>`、`latch<T>` 和 `eventHistory<T>` 的 `InitSpec` 只允许一个全量步骤
-（const 或 random）。`memory<T, rows>` 允许多个 readmem/fill 步骤组合。
+非 array 状态的 `InitSpec` 只允许一个全量步骤（const 或 random）。`core.array` 状态允许
+多个 readmem/fill 步骤组合。
 
-core 方言不为缺失的初值指定隐式默认值。`InitSpec` 应用后必须覆盖状态对象的每一位；GRH 未
+core 方言不为缺失的初值指定隐式默认值。`InitSpec` 应用后必须覆盖状态对象的全部内容；GRH 未
 显式给出初值时（如无 `initValue` 的寄存器或锁存器），转换必须按 SV 语义显式补一个全量
-`core.init.const` 步骤（4-state 为全 X）。memory 的 readmem/fill 步骤只覆盖部分地址时，序列
-必须以这样的全量步骤打底，未覆盖地址按 SV 语义保持全 X。`eventHistory<T>` 的初值没有 GRH
-来源，由转换显式选择一个合法 `T` 值并写入 `InitSpec`。
+`core.init.const` 步骤（4-state 为全 X）。array 状态的 readmem/fill 步骤只覆盖部分地址时，
+序列必须以这样的全量步骤打底，未覆盖地址按 SV 语义保持全 X。边沿历史状态的初值没有 GRH
+来源，由转换显式选择一个合法值并写入 `InitSpec`。
 
 ## 3. Op 命名与公共约定
 
@@ -143,45 +126,60 @@ operands、results 或运算语义。当前直接承接以下关键结构：
 
 | op | operands | object refs | parameters | results |
 | --- | --- | --- | --- | --- |
-| `core.state.regRead` | 无 | 一个 `register<T>` | 无 | 一个 `T` |
-| `core.state.regWrite` | `%updateCond, %nextValue, %mask, %events...` | 一个 `register<T>` 及各 event 的 `eventHistory` | `event_edges` | 无 |
-| `core.state.latchRead` | 无 | 一个 `latch<T>` | 无 | 一个 `T` |
-| `core.state.latchWrite` | `%updateCond, %nextValue, %mask` | 一个 `latch<T>` | 无 | 无 |
-| `core.state.memRead` | `%address` | 一个 `memory<T, rows>` | 无 | 一个 `T` |
-| `core.state.memWrite` | `%updateCond, %address, %data, %mask, %events...` | 一个 `memory<T, rows>` 及各 event 的 `eventHistory` | `event_edges` | 无 |
-| `core.state.memFill` | `%updateCond, %data, %events...` | 一个 `memory<T, rows>` 及各 event 的 `eventHistory` | `event_edges` | 无 |
+| `core.state.read` | 无 | 一个 `S` 对象 | 无 | 一个与目标状态同类型的值 |
+| `core.state.regWrite` | `%updateCond, %nextValue, %mask, %events...` | 一个 `S` 对象及各 event 的历史状态 | `event_edges` | 无 |
+| `core.state.latchWrite` | `%updateCond, %nextValue, %mask` | 一个 `S` 对象 | 无 | 无 |
+| `core.state.memRead` | `%address` | 一个 `core.array` 类型的 `S` 对象 | 无 | 一个元素类型的值 |
+| `core.state.memWrite` | `%updateCond, %address, %data, %mask, %events...` | 一个 `core.array` 类型的 `S` 对象及各 event 的历史状态 | `event_edges` | 无 |
+| `core.state.memFill` | `%updateCond, %data, %events...` | 一个 `core.array` 类型的 `S` 对象及各 event 的历史状态 | `event_edges` | 无 |
+| `core.state.memAssign` | `%updateCond, %data, %events...` | 一个 `core.array` 类型的 `S` 对象及各 event 的历史状态 | `event_edges` | 无 |
+| `core.state.memWriteSeq` | `%updateCond_0, %address_0, %data_0, ..., %updateCond_{N-1}, %address_{N-1}, %data_{N-1}, %events...` | 一个 `core.array` 类型的 `S` 对象及各 event 的历史状态 | `event_edges` | 无 |
 
-`updateCond` 和每个 event 必须是一位 logic。`mask` 与 `T` 的 logic 位宽相同；mask 位为 1 的
-部分允许更新，其他部分保持原值。
+`updateCond` 和每个 event 必须是一位 logic。`mask` 与目标状态的 logic 位宽相同；mask 位为
+1 的部分允许更新，其他部分保持原值。
 
-`regRead` 和 `latchRead` 返回目标的当前值。`memRead` 返回当前 memory 中 `%address` 指定的
-元素，地址必须位于 `[0, rows)`。
+`core.state.read` 返回目标状态的当前值。`memRead` 返回目标状态中 `%address` 指定的元素，
+地址必须小于目标状态的元素个数。
 
-`latchWrite` 在 `%updateCond` 为真时，用 `%nextValue` 的被 mask 选中部分更新 latch。
+`latchWrite` 在 `%updateCond` 为真时，用 `%nextValue` 的被 mask 选中部分更新目标状态。
 `regWrite` 和 `memWrite` 还要求至少一个 event 命中对应边沿；`memWrite` 只更新 `%address`
 指定的元素。条件不成立时目标状态保持原值。
 
-`memFill` 在 `%updateCond` 为真且 event 命中时更新全部 memory 元素。`%data` 可以是一个 `T`
-并广播到所有元素，也可以是包含 `rows` 个 `T` 的 `core.array`；其他形状非法。
+`memFill` 在 `%updateCond` 为真且 event 命中时，把 `%data` 广播写入目标状态的全部元素；
+`%data` 必须是元素类型。`memAssign` 在同样条件下把 `%data` 整体赋给目标状态；`%data`
+必须是与目标状态同类型的 `core.array` 值。
 
-同一 memory 可以有多个写 op，但任意两个 `memWrite`/`memFill` 不能在同一次 `G` 应用中写入
-同一 bit。op 的排列顺序不产生覆盖语义。
+`memWriteSeq` 把对同一 array 状态的一组**有序**条件索引写表达为单个 op。operands 末尾的
+`%events...` 是整个 op 的事件列表，至少一个，不与单个写口关联：任一 event 命中对应边沿即
+触发整个 op，触发后按写口在 operands 中的顺序依次应用——`%updateCond_k` 为真则把 `%data_k`
+写入 `%address_k` 指定的元素，地址相同时后应用的写覆盖先应用的写；无 event 命中时状态
+保持不变。写口数 `N = (|operands| - |events|) / 3`，必须整除；`N = 1` 时语义退化为
+`memWrite`。该 op 承接
+GRH/SV 中由 if/else-if 链表达的多端口优先级写：链序对应 operand 顺序，链头（最高优先级）
+排在 operands 最后。CPU 后端可以把它直接生成为顺序 store（gsim 形态），其他后端也可以
+展开为优先级选择逻辑。不同写口需要不同事件的情况不属于该 op 的承接范围，保持显式多 op
+形态。
+
+同一个 array 状态可以有多个写 op，但任意两个写 op 不能在同一次 `G` 应用中写入同一 bit；
+op 的排列顺序不产生覆盖语义。需要有序覆盖的多写口必须收进单个 `memWriteSeq`，由 operand
+顺序表达覆盖关系。
 
 ## 6. Event 与边沿历史
 
 `event_edges` 与 event operands 一一对应，每项只能是 `posedge` 或 `negedge`。GRH 转换为每个
-“事件敏感 op + event 位置”创建一个 `core.state.eventHistory<T>` 对象，并把它作为同一个 op 的
-object ref。事件敏感 op 包括 register/memory 写口、memory fill、system task 和 DPI call；一个
-GRH op 仍只产生一个 core op。
+“事件敏感 op + event 位置”创建一个 `S` 对象保存该 event 的上一次取值（称为该 event 的历史
+状态，类型与 event operand 相同），并把它作为同一个 op 的 object ref。事件敏感 op 包括
+register/memory 写口、memory fill/assign、system task 和 DPI call；一个 GRH op 仍只产生一个
+core op。
 
-每次应用 `G` 时，事件敏感 op 都把 event 的当前值写入对应 event-history，不受 `updateCond`
-是否成立影响。边沿由 history 和当前 event 共同判定：
+每次应用 `G` 时，事件敏感 op 都把 event 的当前值写入对应历史状态，不受 `updateCond`
+是否成立影响。边沿由历史状态和当前 event 共同判定：
 
 - 对 2-state logic，`posedge` 为 `0 -> 1`，`negedge` 为 `1 -> 0`；
 - 对 4-state logic，边沿集合采用 SystemVerilog 的 `posedge`/`negedge` 规则。
 
-多个 events 中任意一个命中即可触发该 op。event-history 的初始化必须由 `Init` 中对应的
-`InitSpec` 明确给出（见 [2.3](#23-初始化描述-initspec)）。
+多个 events 中任意一个命中即可触发该 op。历史状态的初始化必须由 `Init` 中对应的
+`InitSpec` 明确给出（见 [2.1](#21-初始化描述-initspec)）。
 
 ## 7. 系统调用与 DPI
 
@@ -194,7 +192,7 @@ GRH op 仍只产生一个 core op。
 | op | operands | object refs | parameters | results |
 | --- | --- | --- | --- | --- |
 | `core.system.function` | `%args...` | 无 | `name`, `has_side_effects`, `proc_kind`, `has_timing` | `%result` |
-| `core.system.task` | `%callCond, %args..., %events...` | 各 event 的 `eventHistory` | `name`, `event_edges`, `proc_kind`, `has_timing` | 无 |
+| `core.system.task` | `%callCond, %args..., %events...` | 各 event 的历史状态 | `name`, `event_edges`, `proc_kind`, `has_timing` | 无 |
 
 `name` 是不含 `$` 的 SystemVerilog 系统函数或任务名。`has_side_effects` 是必填布尔值；它只用于
 `core.system.function`，明确该函数是否会改变随机数、文件或其他外部状态。`proc_kind` 必须是
@@ -203,7 +201,7 @@ GRH op 仍只产生一个 core op。
 
 `core.system.function` 的所有 operands 都是函数实参，并产生恰好一个与 GRH result 同类型的
 结果。`core.system.task` 中，令 `q = len(event_edges)`，最后 `q` 个 operands 是 events，第一个
-operand 是一位 `callCond`，中间部分全部是任务实参。在对应过程被激活时，任务只有在
+operand 是逻辑类型的 `callCond`（任意非零位表示真，不限于 1 bit），中间部分全部是任务实参。在对应过程被激活时，任务只有在
 `callCond` 为真，且无 event 或至少一个 event 命中指定边沿时才执行。
 
 例如，`$clog2(x)` 直接产生一个 result：
@@ -238,7 +236,7 @@ core.system.task
 
 ### 7.2 DPI
 
-DPI import 是声明而不是计算，因此不占用 `G` 的 op，而是进入 `SimModel` 的外部函数表 `F`。
+DPI import 只是声明，不产生计算：它不占 `G` 的 op，进入 `GrhSimModel` 的外部函数表 `F`。
 core 方言定义 `F` 表项的声明种类 `core.dpi`，其 `signature` 结构为：
 
 ```text
@@ -259,7 +257,7 @@ DpiSignature
 
 | op | operands | object refs | parameters | results |
 | --- | --- | --- | --- | --- |
-| `core.dpi.call` | `%callCond, %inputArgs..., %inoutArgs..., %events...` | 一个 `F` 对象及各 event 的 `eventHistory` | `event_edges` | `%return?, %outputArgs..., %inoutArgs...` |
+| `core.dpi.call` | `%callCond, %inputArgs..., %inoutArgs..., %events...` | 一个 `F` 对象及各 event 的历史状态 | `event_edges` | `%return?, %outputArgs..., %inoutArgs...` |
 
 `core.dpi.call` 的第一个 object ref 是被调用的 `F` 表项（`decl = core.dpi`），其余 object refs
 是各 event 的 event-history。输入和 inout operand 均按 signature 中的声明顺序排列；results
@@ -289,8 +287,8 @@ core.dpi.call
 ```
 
 `core.system.task`、`has_side_effects = true` 的 `core.system.function` 和 `core.dpi.call` 都是可观察
-操作。若同一次 `G` 应用触发多个这类 op，它们在 `G.ops` 中的相对顺序就是语义顺序；model
-pass 和后端 schedule 都必须保持该顺序。`F` 表项只是声明，不是 op，不参与这个顺序。
+操作。`G` 不规定它们之间的相对顺序；需要确定顺序时，必须用 value 依赖显式表达。`F` 表项
+只是声明，不参与执行。
 
 ## 8. GRH 到 Core 的映射
 
@@ -298,13 +296,13 @@ pass 和后端 schedule 都必须保持该顺序。`F` 表项只是声明，不�
 | --- | --- |
 | graph input | `InputObject` + `core.input.read` |
 | graph output | `OutputObject` + `core.output.write` |
-| `kRegister` | `StateObject: core.state.register<T>` + `Init` 条目 |
-| `kRegisterReadPort` | `core.state.regRead` |
+| `kRegister` | `StateObject`（类型同 GRH 声明）+ `Init` 条目 |
+| `kRegisterReadPort` | `core.state.read` |
 | `kRegisterWritePort` | `core.state.regWrite` |
-| `kLatch` | `StateObject: core.state.latch<T>` + `Init` 条目 |
-| `kLatchReadPort` | `core.state.latchRead` |
+| `kLatch` | `StateObject`（类型同 GRH 声明）+ `Init` 条目 |
+| `kLatchReadPort` | `core.state.read` |
 | `kLatchWritePort` | `core.state.latchWrite` |
-| `kMemory` | `StateObject: core.state.memory<T, rows>` + `Init` 条目 |
+| `kMemory` | `StateObject`（`core.array` 类型）+ `Init` 条目 |
 | `kMemoryReadPort` | `core.state.memRead` |
 | `kMemoryWritePort` | `core.state.memWrite` |
 | `kMemoryFillPort` | `core.state.memFill` |
@@ -349,18 +347,19 @@ core.state.regWrite
 
 Core 模型必须满足：
 
-- state port 引用的 `S` 对象类型与 reg/latch/memory 端口种类匹配；
+- `memRead`/`memWrite`/`memFill`/`memAssign`/`memWriteSeq` 的目标是 `core.array` 类型的状态；
 - read result、data、mask 和目标状态的类型及位宽匹配；
-- event-history 类型与对应 event 类型匹配；
-- memory 地址和 fill data 满足目标 memory 类型；
-- 同一 memory 的多个写 op 不会在同一次 `G` 应用中写入同一 bit；
+- 历史状态的类型与对应 event operand 的类型一致；
+- mem 地址落在目标状态的元素个数范围内；`memFill` 的 `%data` 为元素类型，`memAssign` 的
+  `%data` 与目标状态同类型；
+- `memWriteSeq` 的 operands 数量减去 event 数后必须能被 3 整除；
+- 同一 array 状态的多个写 op 不会在同一次 `G` 应用中写入同一 bit；
 - system function 有且只有一个 result，system task 的条件、参数和 event 分段合法；
 - `F` 表项的 FuncId 唯一、`signature` 完整，DPI call 的目标、operands 和 results 与 signature
   的方向、顺序和类型一致；
-- 每个 `S` 对象的 `InitSpec` 非空，步骤种类与状态类型匹配（readmem/fill 仅用于 memory），
-  范围和值类型合法，且应用后完整覆盖目标状态的每一位；
-- 所有事件敏感 op 的 events、`event_edges` 和 event-history 对象数量及类型一致；
-- 可观察 op 在 `G.ops` 中的相对顺序明确；
+- 每个 `S` 对象的 `InitSpec` 非空，步骤种类与目标状态的类型匹配（readmem/fill 仅用于
+  array 状态），范围和值类型合法，且应用后完整覆盖目标状态的全部内容；
+- 所有事件敏感 op 的 events、`event_edges` 和历史状态数量及类型一致；
 - 一个 GRH storage port、system call 或 DPI call 只对应一个 core op。
 
 ## 11. 参考

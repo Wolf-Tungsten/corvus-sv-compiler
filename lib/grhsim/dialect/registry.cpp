@@ -1,6 +1,7 @@
 #include "grhsim/dialect/registry.hpp"
 
 #include "grhsim/dialect/core.hpp"
+#include "grhsim/dialect/cpu.hpp"
 
 #include <algorithm>
 #include <utility>
@@ -121,7 +122,7 @@ namespace wolvrix::lib::grhsim
     DialectRegistry makeDefaultDialectRegistry()
     {
         DialectRegistry registry;
-        if (!registerCoreDialect(registry))
+        if (!registerCoreDialect(registry) || !registerCpuDialect(registry))
         {
             return {};
         }

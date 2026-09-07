@@ -355,6 +355,10 @@ namespace wolvrix::lib::grhsim
         for (grh::ValueId valueId : graph->values())
         {
             const auto value = graph->getValue(valueId);
+            // GRH rewrites can leave detached names after rebinding output ports.
+            if (!value.definingOp().valid() && !value.isInput() && !value.isOutput() &&
+                !value.isInout() && value.users().empty())
+                continue;
             const OriginId origin = makeOrigin(*model, options.keepOrigins, "grh.value",
                                                value.symbolText(), valueId.index, value.srcLoc());
             valueMap[valueId.index] = model->addValue(

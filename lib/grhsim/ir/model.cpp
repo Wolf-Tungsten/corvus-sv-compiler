@@ -389,6 +389,31 @@ namespace wolvrix::lib::grhsim
             appendRange(mappingParameterPool_, parameters), identity_, semanticRevision_});
     }
 
+    const CpuBackendMapping *GrhSimModel::cpuMapping() const noexcept
+    {
+        for (const auto &mapping : mappings_)
+            if (mapping.cpu) return &*mapping.cpu;
+        return nullptr;
+    }
+
+    void GrhSimModel::setCpuMapping(CpuBackendMapping cpu)
+    {
+        const auto backend = intern("cpu");
+        const auto schema = intern("cpu.st.v1");
+        for (auto &mapping : mappings_)
+        {
+            if (mapping.backend != backend) continue;
+            mapping.schema = schema;
+            mapping.complete = cpu.stage == CpuMappingStage::Schedule;
+            mapping.sourceIdentity = identity_;
+            mapping.sourceSemanticRevision = semanticRevision_;
+            mapping.cpu = std::move(cpu);
+            return;
+        }
+        addMapping("cpu", "cpu.st.v1", cpu.stage == CpuMappingStage::Schedule);
+        mappings_.back().cpu = std::move(cpu);
+    }
+
     std::span<const ValueId> GrhSimModel::operands(const SimOp &op) const
     {
         return checkedSpan(operandPool_, op.operands, "operation operand");

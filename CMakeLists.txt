@@ -111,6 +111,7 @@ set(WOLVRIX_LIB_SOURCES
     lib/core/emit.cpp
     lib/core/toposort.cpp
     lib/emit/grhsim_cpp.cpp
+    lib/emit/grhsim_runtime.cpp
     lib/emit/system_verilog.cpp
     lib/emit/verilator_repcut_package.cpp
     lib/core/store.cpp
@@ -120,7 +121,13 @@ set(WOLVRIX_LIB_SOURCES
     lib/grhsim/ir/verifier.cpp
     lib/grhsim/dialect/registry.cpp
     lib/grhsim/dialect/core.cpp
+    lib/grhsim/dialect/cpu.cpp
     lib/grhsim/pass/pass.cpp
+    lib/grhsim/backend/cpu.cpp
+    lib/grhsim/backend/cpu_partition.cpp
+    lib/grhsim/backend/cpu_layout.cpp
+    lib/grhsim/backend/cpu_schedule.cpp
+    lib/grhsim/backend/cpu_emit.cpp
     lib/grhsim/convert/grh_to_grhsim.cpp
     lib/grhsim/io/json.cpp
     lib/transform/activity_schedule.cpp
@@ -345,6 +352,23 @@ target_compile_definitions(grhsim-ir-tests
 )
 
 register_test_exe(grhsim-ir-tests)
+
+add_executable(grhsim-cpu-mapping-tests tests/grhsim/test_cpu_mapping.cpp)
+target_link_libraries(grhsim-cpu-mapping-tests PRIVATE wolvrix-lib)
+register_test_exe(grhsim-cpu-mapping-tests)
+add_executable(grhsim-cpu-schedule-tests tests/grhsim/test_cpu_schedule.cpp tests/grhsim/test_cpu_schedule_trace.cpp)
+target_link_libraries(grhsim-cpu-schedule-tests PRIVATE wolvrix-lib)
+register_test_exe(grhsim-cpu-schedule-tests)
+find_program(WOLVRIX_TEST_VERILATOR verilator)
+add_executable(grhsim-cpu-emit-tests tests/grhsim/test_cpu_emit.cpp)
+target_link_libraries(grhsim-cpu-emit-tests PRIVATE wolvrix-lib)
+target_compile_definitions(grhsim-cpu-emit-tests PRIVATE
+    WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR="${WOLF_SV_TEST_ARTIFACT_DIR}/grhsim"
+    WOLVRIX_GRHSIM_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/grhsim/data"
+    WOLVRIX_TEST_CXX="${CMAKE_CXX_COMPILER}"
+    WOLVRIX_TEST_VERILATOR="${WOLVRIX_TEST_VERILATOR}")
+register_test_exe(grhsim-cpu-emit-tests)
+set_tests_properties(grhsim-cpu-emit-tests PROPERTIES SKIP_RETURN_CODE 77)
 
 # core: toposort
 add_executable(core-toposort

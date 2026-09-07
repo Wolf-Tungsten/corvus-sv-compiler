@@ -1,4 +1,5 @@
 #include "grhsim/ir/verifier.hpp"
+#include "grhsim/backend/cpu.hpp"
 
 #include "grhsim/dialect/registry.hpp"
 #include "grhsim/ir/model.hpp"
@@ -161,6 +162,8 @@ namespace wolvrix::lib::grhsim
                 error("type ID does not match stable table position", context);
             if (!model.strings().valid(type.typeRef) || !registry.hasType(model.text(type.typeRef)))
                 error("type has an unknown dialect reference", context);
+            else if (model.text(type.typeRef).starts_with("cpu."))
+                error("CPU types may only occur in backend mappings", context);
             switch (type.kind)
             {
             case TypeKind::Logic:
@@ -424,6 +427,7 @@ namespace wolvrix::lib::grhsim
         }
 
         std::unordered_set<uint32_t> mappingBackends;
+        const bool validModel = ok && !diagnostics.hasError();
         for (std::size_t i = 0; i < model.mappings().size(); ++i)
         {
             const BackendMapping &mapping = model.mappings()[i];
@@ -439,6 +443,8 @@ namespace wolvrix::lib::grhsim
             {
                 validParameters(model, model.parameters(mapping), diagnostics,
                                 [&context] { return context; });
+                if (validModel && (mapping.cpu || model.text(mapping.backend) == "cpu"))
+                    if (!verifyCpuMapping(model, mapping, diagnostics)) ok = false;
             }
             catch (const std::exception &ex)
             {

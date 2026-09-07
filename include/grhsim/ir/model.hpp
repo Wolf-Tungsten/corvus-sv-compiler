@@ -36,6 +36,9 @@ namespace wolvrix::lib::grhsim
     struct ValueTag;
     struct OpTag;
     struct OriginTag;
+    struct PartitionTag;
+    struct CpuTypeTag;
+    struct CpuTaskTag;
 
     using StringId = Id<StringTag>;
     using TypeId = Id<TypeTag>;
@@ -46,6 +49,9 @@ namespace wolvrix::lib::grhsim
     using ValueId = Id<ValueTag>;
     using OpId = Id<OpTag>;
     using OriginId = Id<OriginTag>;
+    using PartitionId = Id<PartitionTag>;
+    using CpuTypeId = Id<CpuTypeTag>;
+    using CpuTaskId = Id<CpuTaskTag>;
 
     struct Range
     {
@@ -203,6 +209,7 @@ namespace wolvrix::lib::grhsim
         uint32_t generation = 0;
 
         bool valid() const noexcept { return index != 0; }
+        friend bool operator==(const ObjectRef &, const ObjectRef &) = default;
 
         static ObjectRef input(InputId id) noexcept;
         static ObjectRef output(OutputId id) noexcept;
@@ -273,6 +280,187 @@ namespace wolvrix::lib::grhsim
         Range steps;
     };
 
+    enum class CpuPhase : uint8_t { None, Compute, Commit };
+    enum class CpuPartitionKind : uint8_t { Root, Phase, EventDomain, Supernode, Node, ActiveWord, EmitFunction };
+    enum class CpuEventSource : uint8_t { Input, Derived };
+    enum class CpuEventEdge : uint8_t { Posedge, Negedge };
+    enum class CpuMappingStage : uint8_t { SplitPhase, EventDomains, ComputeNodes, ComputeSupernodes, ActiveWords, EmitFunctions, DataLayout, Schedule };
+
+    struct CpuEvent
+    {
+        ValueId value;
+        CpuEventEdge edge = CpuEventEdge::Posedge;
+        friend bool operator==(const CpuEvent &, const CpuEvent &) = default;
+    };
+
+    struct CpuEventGate
+    {
+        CpuEventSource source = CpuEventSource::Derived;
+        std::vector<CpuEvent> events;
+        friend bool operator==(const CpuEventGate &, const CpuEventGate &) = default;
+    };
+
+    struct CpuPartitionAttrs
+    {
+        CpuPartitionKind kind = CpuPartitionKind::Root;
+        CpuPhase phase = CpuPhase::None;
+        // An event-domain partition without a gate is scanned every round.
+        std::optional<CpuEventGate> eventGate;
+        std::optional<uint32_t> activeId;
+        std::optional<uint32_t> activeWord;
+        // Ranges in the supernode's flattened operation order, not model OpIds.
+        std::vector<Range> helperChunks;
+    };
+
+    struct CpuPartition
+    {
+        PartitionId id;
+        PartitionId parent;
+        std::vector<PartitionId> children;
+        std::vector<OpId> ops;
+        CpuPartitionAttrs attrs;
+    };
+
+    struct CpuPartitionTree
+    {
+        PartitionId root;
+        std::vector<CpuPartition> partitions;
+    };
+
+    enum class CpuTypeKind : uint8_t { Bool, UInt, SInt, F32, F64, String, Array };
+    enum class CpuStorageKind : uint8_t { Object, PartitionLocal, Boundary };
+    enum class CpuRuntimeKind : uint8_t { ActiveWord, DomainArm, EventEdge };
+
+    struct CpuType
+    {
+        CpuTypeId id;
+        CpuTypeKind kind = CpuTypeKind::Bool;
+        uint32_t width = 0;
+        CpuTypeId elementType;
+        uint64_t count = 0;
+        uint64_t size = 0;
+        uint32_t alignment = 1;
+        friend bool operator==(const CpuType &, const CpuType &) = default;
+    };
+
+    struct CpuDataSlot
+    {
+        CpuTypeId type;
+        CpuStorageKind kind = CpuStorageKind::Object;
+        PartitionId owner;
+        uint64_t offset = 0;
+        friend bool operator==(const CpuDataSlot &, const CpuDataSlot &) = default;
+    };
+
+    struct CpuObjectLayout
+    {
+        ObjectRef object;
+        CpuDataSlot slot;
+        friend bool operator==(const CpuObjectLayout &, const CpuObjectLayout &) = default;
+    };
+
+    struct CpuLocalFrame
+    {
+        PartitionId owner;
+        uint64_t size = 0;
+        uint32_t alignment = 1;
+        friend bool operator==(const CpuLocalFrame &, const CpuLocalFrame &) = default;
+    };
+
+    struct CpuRuntimeSlot
+    {
+        CpuRuntimeKind kind = CpuRuntimeKind::ActiveWord;
+        PartitionId owner;
+        ValueId value;
+        CpuEventEdge edge = CpuEventEdge::Posedge;
+        uint64_t offset = 0;
+        friend bool operator==(const CpuRuntimeSlot &, const CpuRuntimeSlot &) = default;
+    };
+
+    struct CpuDataLayout
+    {
+        uint32_t pointerBytes = 8;
+        std::vector<CpuType> types;
+        std::vector<CpuObjectLayout> objects;
+        // Dense ValueId order; local offsets refer to the owning supernode frame.
+        std::vector<CpuDataSlot> values;
+        std::vector<CpuLocalFrame> localFrames;
+        std::vector<CpuRuntimeSlot> runtime;
+        uint64_t objectBytes = 0;
+        uint64_t boundaryBytes = 0;
+        uint64_t runtimeBytes = 0;
+        friend bool operator==(const CpuDataLayout &, const CpuDataLayout &) = default;
+    };
+
+    enum class CpuExecution : uint8_t { ActivityDrivenCompute, DomainGatedCommit, AlwaysScanCommit };
+
+    struct CpuActivationTargets
+    {
+        std::vector<PartitionId> activate;
+        std::vector<PartitionId> arm;
+        friend bool operator==(const CpuActivationTargets &, const CpuActivationTargets &) = default;
+    };
+
+    template <typename SourceId>
+    struct CpuFanoutEntry
+    {
+        SourceId source;
+        CpuActivationTargets targets;
+        friend bool operator==(const CpuFanoutEntry &, const CpuFanoutEntry &) = default;
+    };
+
+    struct CpuScheduledTask
+    {
+        CpuTaskId id;
+        PartitionId partition;
+        std::vector<CpuTaskId> waitsFor;
+        CpuExecution execution = CpuExecution::ActivityDrivenCompute;
+        friend bool operator==(const CpuScheduledTask &, const CpuScheduledTask &) = default;
+    };
+
+    struct CpuCoreSchedule
+    {
+        uint32_t core = 0;
+        std::vector<CpuScheduledTask> tasks;
+        friend bool operator==(const CpuCoreSchedule &, const CpuCoreSchedule &) = default;
+    };
+
+    struct CpuNumaSchedule
+    {
+        uint32_t numaNode = 0;
+        std::vector<CpuCoreSchedule> cores;
+        friend bool operator==(const CpuNumaSchedule &, const CpuNumaSchedule &) = default;
+    };
+
+    struct CpuInputShadow
+    {
+        ValueId value;
+        CpuTypeId type;
+        uint64_t offset = 0;
+        friend bool operator==(const CpuInputShadow &, const CpuInputShadow &) = default;
+    };
+
+    struct CpuSchedulePlan
+    {
+        std::vector<CpuNumaSchedule> numaNodes;
+        std::vector<CpuFanoutEntry<ValueId>> inputFanout;
+        std::vector<CpuFanoutEntry<ValueId>> computeSupernodeFanout;
+        // The key set is the exact output/event state dependency closure E.
+        std::vector<CpuFanoutEntry<StateId>> commitStateFanout;
+        std::vector<PartitionId> roundSeeds;
+        std::vector<CpuInputShadow> inputShadows;
+        uint64_t inputShadowBytes = 0;
+        friend bool operator==(const CpuSchedulePlan &, const CpuSchedulePlan &) = default;
+    };
+
+    struct CpuBackendMapping
+    {
+        CpuMappingStage stage = CpuMappingStage::SplitPhase;
+        CpuPartitionTree partitionTree;
+        std::optional<CpuDataLayout> dataLayout;
+        std::optional<CpuSchedulePlan> schedule;
+    };
+
     struct BackendMapping
     {
         StringId backend;
@@ -281,6 +469,7 @@ namespace wolvrix::lib::grhsim
         Range parameters;
         ModelIdentity sourceIdentity;
         uint64_t sourceSemanticRevision = 0;
+        std::optional<CpuBackendMapping> cpu;
     };
 
     struct ModelReserve
@@ -361,6 +550,8 @@ namespace wolvrix::lib::grhsim
                      std::span<const Parameter> stepParameters);
         void addMapping(std::string_view backend, std::string_view schema, bool complete,
                         std::span<const Parameter> parameters = {});
+        const CpuBackendMapping *cpuMapping() const noexcept;
+        void setCpuMapping(CpuBackendMapping mapping);
 
         const std::vector<DialectUse> &dialects() const noexcept { return dialects_; }
         const std::vector<Type> &types() const noexcept { return types_; }

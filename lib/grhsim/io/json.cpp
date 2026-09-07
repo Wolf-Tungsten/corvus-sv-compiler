@@ -530,6 +530,347 @@ namespace wolvrix::lib::grhsim
 
         void expectComma(StreamReader &reader) { reader.expect(','); }
 
+        void writeCpuSlot(StreamWriter &writer, const CpuDataSlot &slot)
+        {
+            writer.startArray(); writeId(writer, slot.type);
+            writer.value(static_cast<uint64_t>(slot.kind)); writeId(writer, slot.owner);
+            writer.value(slot.offset); writer.endArray();
+        }
+
+        void writeCpuLayout(StreamWriter &writer, const CpuDataLayout &layout)
+        {
+            writer.startArray(); writer.value(static_cast<uint64_t>(layout.pointerBytes));
+            writer.startArray();
+            for (const auto &type : layout.types)
+            {
+                writer.startArray(); writeId(writer, type.id);
+                writer.value(static_cast<uint64_t>(type.kind)); writer.value(static_cast<uint64_t>(type.width));
+                writeId(writer, type.elementType); writer.value(type.count); writer.value(type.size);
+                writer.value(static_cast<uint64_t>(type.alignment)); writer.endArray();
+            }
+            writer.endArray(); writer.startArray();
+            for (const auto &entry : layout.objects)
+            {
+                writer.startArray(); writer.value(static_cast<uint64_t>(entry.object.kind));
+                writer.value(static_cast<uint64_t>(entry.object.index)); writeCpuSlot(writer, entry.slot);
+                writer.endArray();
+            }
+            writer.endArray(); writer.startArray();
+            for (const auto &slot : layout.values) writeCpuSlot(writer, slot);
+            writer.endArray(); writer.startArray();
+            for (const auto &frame : layout.localFrames)
+            {
+                writer.startArray(); writeId(writer, frame.owner); writer.value(frame.size);
+                writer.value(static_cast<uint64_t>(frame.alignment)); writer.endArray();
+            }
+            writer.endArray(); writer.startArray();
+            for (const auto &slot : layout.runtime)
+            {
+                writer.startArray(); writer.value(static_cast<uint64_t>(slot.kind)); writeId(writer, slot.owner);
+                writeId(writer, slot.value); writer.value(static_cast<uint64_t>(slot.edge));
+                writer.value(slot.offset); writer.endArray();
+            }
+            writer.endArray(); writer.value(layout.objectBytes); writer.value(layout.boundaryBytes);
+            writer.value(layout.runtimeBytes); writer.endArray();
+        }
+
+        template <typename SourceId>
+        void writeCpuFanout(StreamWriter &writer, const std::vector<CpuFanoutEntry<SourceId>> &rows)
+        {
+            writer.startArray();
+            for (const auto &row : rows)
+            {
+                writer.startArray(); writeId(writer, row.source);
+                writeIdArray<PartitionId>(writer, row.targets.activate);
+                writeIdArray<PartitionId>(writer, row.targets.arm); writer.endArray();
+            }
+            writer.endArray();
+        }
+
+        void writeCpuSchedule(StreamWriter &writer, const CpuSchedulePlan &schedule)
+        {
+            writer.startArray(); writer.startArray();
+            for (const auto &node : schedule.numaNodes)
+            {
+                writer.startArray(); writer.value(static_cast<uint64_t>(node.numaNode)); writer.startArray();
+                for (const auto &core : node.cores)
+                {
+                    writer.startArray(); writer.value(static_cast<uint64_t>(core.core)); writer.startArray();
+                    for (const auto &task : core.tasks)
+                    {
+                        writer.startArray(); writeId(writer, task.id); writeId(writer, task.partition);
+                        writeIdArray<CpuTaskId>(writer, task.waitsFor);
+                        writer.value(static_cast<uint64_t>(task.execution)); writer.endArray();
+                    }
+                    writer.endArray(); writer.endArray();
+                }
+                writer.endArray(); writer.endArray();
+            }
+            writer.endArray();
+            writeCpuFanout(writer, schedule.inputFanout); writeCpuFanout(writer, schedule.computeSupernodeFanout);
+            writeCpuFanout(writer, schedule.commitStateFanout); writeIdArray<PartitionId>(writer, schedule.roundSeeds);
+            writer.startArray();
+            for (const auto &shadow : schedule.inputShadows)
+            {
+                writer.startArray(); writeId(writer, shadow.value); writeId(writer, shadow.type);
+                writer.value(shadow.offset); writer.endArray();
+            }
+            writer.endArray(); writer.value(schedule.inputShadowBytes); writer.endArray();
+        }
+
+        void writeCpuMapping(StreamWriter &writer, const CpuBackendMapping &cpu)
+        {
+            writer.startArray();
+            writer.value(static_cast<uint64_t>(cpu.stage));
+            writeId(writer, cpu.partitionTree.root);
+            writer.startArray();
+            for (const auto &partition : cpu.partitionTree.partitions)
+            {
+                writer.startArray();
+                writeId(writer, partition.id); writeId(writer, partition.parent);
+                writer.value(static_cast<uint64_t>(partition.attrs.kind));
+                writer.value(static_cast<uint64_t>(partition.attrs.phase));
+                writeIdArray<PartitionId>(writer, partition.children);
+                writeIdArray<OpId>(writer, partition.ops);
+                writer.startArray();
+                if (partition.attrs.eventGate)
+                {
+                    const auto &gate = *partition.attrs.eventGate;
+                    writer.value(static_cast<uint64_t>(gate.source));
+                    writer.startArray();
+                    for (const auto &event : gate.events)
+                    {
+                        writer.startArray(); writeId(writer, event.value);
+                        writer.value(static_cast<uint64_t>(event.edge)); writer.endArray();
+                    }
+                    writer.endArray();
+                }
+                writer.endArray();
+                if (partition.attrs.activeId || partition.attrs.activeWord || !partition.attrs.helperChunks.empty())
+                {
+                    writer.startArray();
+                    writer.startArray();
+                    if (partition.attrs.activeId) writer.value(static_cast<uint64_t>(*partition.attrs.activeId));
+                    writer.endArray(); writer.startArray();
+                    if (partition.attrs.activeWord) writer.value(static_cast<uint64_t>(*partition.attrs.activeWord));
+                    writer.endArray(); writer.startArray();
+                    for (auto chunk : partition.attrs.helperChunks)
+                    {
+                        writer.startArray(); writer.value(static_cast<uint64_t>(chunk.offset));
+                        writer.value(static_cast<uint64_t>(chunk.count)); writer.endArray();
+                    }
+                    writer.endArray(); writer.endArray();
+                }
+                writer.endArray();
+            }
+            writer.endArray();
+            if (cpu.dataLayout) writeCpuLayout(writer, *cpu.dataLayout);
+            if (cpu.schedule) writeCpuSchedule(writer, *cpu.schedule);
+            writer.endArray();
+        }
+
+        template <typename Enum>
+        Enum readCpuEnum(StreamReader &reader, Enum last)
+        {
+            const auto value = reader.unsignedInteger();
+            if (value > static_cast<uint64_t>(last))
+                throw std::runtime_error("unknown CPU mapping enum value");
+            return static_cast<Enum>(value);
+        }
+
+        CpuDataSlot readCpuSlot(StreamReader &reader)
+        {
+            CpuDataSlot slot;
+            reader.startArray(); slot.type = readId<CpuTypeId>(reader, "CPU type");
+            expectComma(reader); slot.kind = readCpuEnum(reader, CpuStorageKind::Boundary);
+            expectComma(reader); slot.owner = readId<PartitionId>(reader, "storage owner", true);
+            expectComma(reader); slot.offset = reader.unsignedInteger(); reader.endArray();
+            return slot;
+        }
+
+        CpuDataLayout readCpuLayout(StreamReader &reader)
+        {
+            CpuDataLayout layout;
+            reader.startArray(); layout.pointerBytes = reader.index("pointer bytes");
+            expectComma(reader); reader.startArray(); bool first = true;
+            while (reader.nextArray(first))
+            {
+                CpuType type;
+                reader.startArray(); type.id = readId<CpuTypeId>(reader, "CPU type ID");
+                expectComma(reader); type.kind = readCpuEnum(reader, CpuTypeKind::Array);
+                expectComma(reader); type.width = reader.index("CPU width", true);
+                expectComma(reader); type.elementType = readId<CpuTypeId>(reader, "CPU element type", true);
+                expectComma(reader); type.count = reader.unsignedInteger();
+                expectComma(reader); type.size = reader.unsignedInteger();
+                expectComma(reader); type.alignment = reader.index("CPU alignment"); reader.endArray();
+                layout.types.push_back(type);
+            }
+            expectComma(reader); reader.startArray(); first = true;
+            while (reader.nextArray(first))
+            {
+                CpuObjectLayout entry;
+                reader.startArray(); entry.object.kind = readCpuEnum(reader, ObjectKind::Function);
+                expectComma(reader); entry.object.index = reader.index("CPU object index");
+                expectComma(reader); entry.slot = readCpuSlot(reader); reader.endArray();
+                layout.objects.push_back(entry);
+            }
+            expectComma(reader); reader.startArray(); first = true;
+            while (reader.nextArray(first)) layout.values.push_back(readCpuSlot(reader));
+            expectComma(reader); reader.startArray(); first = true;
+            while (reader.nextArray(first))
+            {
+                CpuLocalFrame frame;
+                reader.startArray(); frame.owner = readId<PartitionId>(reader, "frame owner");
+                expectComma(reader); frame.size = reader.unsignedInteger();
+                expectComma(reader); frame.alignment = reader.index("frame alignment"); reader.endArray();
+                layout.localFrames.push_back(frame);
+            }
+            expectComma(reader); reader.startArray(); first = true;
+            while (reader.nextArray(first))
+            {
+                CpuRuntimeSlot slot;
+                reader.startArray(); slot.kind = readCpuEnum(reader, CpuRuntimeKind::EventEdge);
+                expectComma(reader); slot.owner = readId<PartitionId>(reader, "runtime owner");
+                expectComma(reader); slot.value = readId<ValueId>(reader, "runtime event value", true);
+                expectComma(reader); slot.edge = readCpuEnum(reader, CpuEventEdge::Negedge);
+                expectComma(reader); slot.offset = reader.unsignedInteger(); reader.endArray();
+                layout.runtime.push_back(slot);
+            }
+            expectComma(reader); layout.objectBytes = reader.unsignedInteger();
+            expectComma(reader); layout.boundaryBytes = reader.unsignedInteger();
+            expectComma(reader); layout.runtimeBytes = reader.unsignedInteger(); reader.endArray();
+            return layout;
+        }
+
+        template <typename SourceId>
+        std::vector<CpuFanoutEntry<SourceId>> readCpuFanout(StreamReader &reader)
+        {
+            std::vector<CpuFanoutEntry<SourceId>> rows;
+            reader.startArray(); bool first = true;
+            while (reader.nextArray(first))
+            {
+                CpuFanoutEntry<SourceId> row;
+                reader.startArray(); row.source = readId<SourceId>(reader, "fanout source");
+                expectComma(reader); row.targets.activate = readIdArray<PartitionId>(reader, "activation target");
+                expectComma(reader); row.targets.arm = readIdArray<PartitionId>(reader, "arm target");
+                reader.endArray(); rows.push_back(std::move(row));
+            }
+            return rows;
+        }
+
+        CpuSchedulePlan readCpuSchedule(StreamReader &reader)
+        {
+            CpuSchedulePlan schedule;
+            reader.startArray(); reader.startArray(); bool first = true;
+            while (reader.nextArray(first))
+            {
+                CpuNumaSchedule node;
+                reader.startArray(); node.numaNode = reader.index("NUMA node", true);
+                expectComma(reader); reader.startArray(); bool coreFirst = true;
+                while (reader.nextArray(coreFirst))
+                {
+                    CpuCoreSchedule core;
+                    reader.startArray(); core.core = reader.index("CPU core", true);
+                    expectComma(reader); reader.startArray(); bool taskFirst = true;
+                    while (reader.nextArray(taskFirst))
+                    {
+                        CpuScheduledTask task;
+                        reader.startArray(); task.id = readId<CpuTaskId>(reader, "task ID");
+                        expectComma(reader); task.partition = readId<PartitionId>(reader, "task partition");
+                        expectComma(reader); task.waitsFor = readIdArray<CpuTaskId>(reader, "task dependency");
+                        expectComma(reader); task.execution = readCpuEnum(reader, CpuExecution::AlwaysScanCommit);
+                        reader.endArray(); core.tasks.push_back(std::move(task));
+                    }
+                    reader.endArray(); node.cores.push_back(std::move(core));
+                }
+                reader.endArray(); schedule.numaNodes.push_back(std::move(node));
+            }
+            expectComma(reader); schedule.inputFanout = readCpuFanout<ValueId>(reader);
+            expectComma(reader); schedule.computeSupernodeFanout = readCpuFanout<ValueId>(reader);
+            expectComma(reader); schedule.commitStateFanout = readCpuFanout<StateId>(reader);
+            expectComma(reader); schedule.roundSeeds = readIdArray<PartitionId>(reader, "round seed");
+            expectComma(reader); reader.startArray(); first = true;
+            while (reader.nextArray(first))
+            {
+                CpuInputShadow shadow;
+                reader.startArray(); shadow.value = readId<ValueId>(reader, "shadow value");
+                expectComma(reader); shadow.type = readId<CpuTypeId>(reader, "shadow type");
+                expectComma(reader); shadow.offset = reader.unsignedInteger(); reader.endArray();
+                schedule.inputShadows.push_back(shadow);
+            }
+            expectComma(reader); schedule.inputShadowBytes = reader.unsignedInteger(); reader.endArray();
+            return schedule;
+        }
+
+        CpuBackendMapping readCpuMapping(StreamReader &reader)
+        {
+            CpuBackendMapping cpu;
+            reader.startArray(); cpu.stage = readCpuEnum(reader, CpuMappingStage::Schedule);
+            expectComma(reader); cpu.partitionTree.root = readId<PartitionId>(reader, "partition root");
+            expectComma(reader); reader.startArray();
+            bool first = true;
+            while (reader.nextArray(first))
+            {
+                CpuPartition partition;
+                reader.startArray(); partition.id = readId<PartitionId>(reader, "partition ID");
+                expectComma(reader); partition.parent = readId<PartitionId>(reader, "partition parent", true);
+                expectComma(reader); partition.attrs.kind = readCpuEnum(reader, CpuPartitionKind::EmitFunction);
+                expectComma(reader); partition.attrs.phase = readCpuEnum(reader, CpuPhase::Commit);
+                expectComma(reader); partition.children = readIdArray<PartitionId>(reader, "partition child");
+                expectComma(reader); partition.ops = readIdArray<OpId>(reader, "partition op");
+                expectComma(reader); reader.startArray();
+                bool gateFirst = true;
+                if (reader.nextArray(gateFirst))
+                {
+                    CpuEventGate gate;
+                    gate.source = readCpuEnum(reader, CpuEventSource::Derived);
+                    expectComma(reader); reader.startArray();
+                    bool eventFirst = true;
+                    while (reader.nextArray(eventFirst))
+                    {
+                        CpuEvent event;
+                        reader.startArray(); event.value = readId<ValueId>(reader, "event value");
+                        expectComma(reader); event.edge = readCpuEnum(reader, CpuEventEdge::Negedge);
+                        reader.endArray(); gate.events.push_back(event);
+                    }
+                    reader.endArray(); partition.attrs.eventGate = std::move(gate);
+                }
+                bool tailFirst = false;
+                if (reader.nextArray(tailFirst))
+                {
+                    reader.startArray();
+                    const auto optionalIndex = [&]() -> std::optional<uint32_t> {
+                        reader.startArray(); bool first = true;
+                        if (!reader.nextArray(first)) return {};
+                        const auto value = reader.index("activity index", true); reader.endArray();
+                        return value;
+                    };
+                    partition.attrs.activeId = optionalIndex(); expectComma(reader);
+                    partition.attrs.activeWord = optionalIndex(); expectComma(reader);
+                    reader.startArray(); bool first = true;
+                    while (reader.nextArray(first))
+                    {
+                        reader.startArray(); const auto offset = reader.index("helper offset", true);
+                        expectComma(reader); const auto count = reader.index("helper count"); reader.endArray();
+                        partition.attrs.helperChunks.push_back({offset, count});
+                    }
+                    reader.endArray(); reader.endArray();
+                }
+                cpu.partitionTree.partitions.push_back(std::move(partition));
+            }
+            bool tailFirst = false;
+            if (reader.nextArray(tailFirst))
+            {
+                cpu.dataLayout = readCpuLayout(reader);
+                if (reader.nextArray(tailFirst))
+                {
+                    cpu.schedule = readCpuSchedule(reader);
+                    reader.endArray();
+                }
+            }
+            return cpu;
+        }
+
         void writeCounts(StreamWriter &writer, const GrhSimModel &model)
         {
             writer.startObject();
@@ -755,6 +1096,7 @@ namespace wolvrix::lib::grhsim
             {
                 writer.startArray(); writeId(writer, mapping.backend); writeId(writer, mapping.schema);
                 writer.value(mapping.complete); writeParameterArray(writer, model.parameters(mapping));
+                if (mapping.cpu) writeCpuMapping(writer, *mapping.cpu);
                 writer.endArray();
             }
             writer.endArray();
@@ -961,8 +1303,19 @@ namespace wolvrix::lib::grhsim
                 reader.startArray(); const StringId backend = readId<StringId>(reader, "mapping backend");
                 expectComma(reader); const StringId schema = readId<StringId>(reader, "mapping schema");
                 expectComma(reader); const bool complete = reader.boolean();
-                expectComma(reader); auto parameters = readParameterArray(reader); reader.endArray();
+                expectComma(reader); auto parameters = readParameterArray(reader);
                 model->addMapping(model->text(backend), model->text(schema), complete, parameters);
+                bool tailFirst = false;
+                if (reader.nextArray(tailFirst))
+                {
+                    if (model->text(backend) != "cpu" || model->text(schema) != "cpu.st.v1")
+                        throw std::runtime_error("unexpected CPU mapping payload or completion flag");
+                    auto cpu = readCpuMapping(reader);
+                    if (complete != (cpu.stage == CpuMappingStage::Schedule))
+                        throw std::runtime_error("CPU mapping completion disagrees with stage");
+                    model->setCpuMapping(std::move(cpu));
+                    reader.endArray();
+                }
             }
             reader.endObject(); reader.finish();
             verifyCounts(*model, counts);

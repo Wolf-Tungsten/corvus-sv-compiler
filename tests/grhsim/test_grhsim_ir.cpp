@@ -193,6 +193,40 @@ namespace
         return 0;
     }
 
+    int runDetachedValueTest()
+    {
+        for (unsigned mode = 0; mode < 3; ++mode)
+        {
+            grh::Design design;
+            auto &graph = design.createGraph("top"); design.markAsTop("top");
+            const auto input = graph.createValue(graph.internSymbol("unused_input"), 8, false);
+            graph.bindInputPort("unused_input", input);
+            const auto produced = graph.createValue(graph.internSymbol("produced"), 8, false);
+            const auto constant = graph.createOperation(grh::OperationKind::kConstant, graph.internSymbol("constant"));
+            graph.setAttr(constant, "constValue", std::string("8'h5a")); graph.addResult(constant, produced);
+            const auto detached = graph.createValue(graph.internSymbol("detached"), 8, false);
+            if (mode == 1) graph.bindOutputPort("floating", detached);
+            if (mode == 2)
+            {
+                const auto result = graph.createValue(graph.internSymbol("result"), 8, false);
+                const auto invert = graph.createOperation(grh::OperationKind::kNot, graph.internSymbol("invert"));
+                graph.addOperand(invert, detached); graph.addResult(invert, result);
+                graph.bindOutputPort("result", result);
+            }
+            diag::Diagnostics diagnostics;
+            grhsim::GrhToGrhSimOptions options; options.top = "top";
+            options.logicDomain = grhsim::LogicDomain::TwoState;
+            const auto model = grhsim::lowerGrhToGrhSim(design, options, diagnostics);
+            if (mode == 0)
+            {
+                if (!model || diagnostics.hasError() || model->values().size() != 2 || model->operations().size() != 2)
+                    return fail("detached value was not skipped or unused input/producer was removed");
+            }
+            else if (model || !diagnostics.hasError()) return fail("referenced undriven value was silently dropped");
+        }
+        return 0;
+    }
+
     int runHierarchyRejectionTest()
     {
         grh::Design design;
@@ -218,6 +252,7 @@ int main()
     {
         if (const int status = runRoundTripTest(WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR); status != 0)
             return status;
+        if (const int status = runDetachedValueTest(); status != 0) return status;
         return runHierarchyRejectionTest();
     }
     catch (const std::exception &ex)

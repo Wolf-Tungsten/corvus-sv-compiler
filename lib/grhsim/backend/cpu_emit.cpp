@@ -1,0 +1,2002 @@
+#include "grhsim/backend/cpu_emit.hpp"
+
+#include "emit/grhsim_runtime.hpp"
+#include "emit/readmem.hpp"
+#include "grhsim/backend/cpu.hpp"
+#include "grhsim/dialect/registry.hpp"
+#include "grhsim/ir/verifier.hpp"
+#include "slang/numeric/SVInt.h"
+
+#include <algorithm>
+#include <fstream>
+#include <limits>
+#include <map>
+#include <set>
+#include <sstream>
+#include <stdexcept>
+#include <streambuf>
+
+namespace wolvrix::lib::grhsim
+{
+    namespace
+    {
+        std::string identifier(std::string_view text)
+        {
+            std::string result;
+            for (char ch : text)
+                result += (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                          (ch >= '0' && ch <= '9') || ch == '_' ? ch : '_';
+            if (result.empty() || (result.front() >= '0' && result.front() <= '9')) result.insert(0, "n_");
+            return result;
+        }
+
+        template <typename T>
+        const T *parameter(const GrhSimModel &model, std::span<const Parameter> parameters, std::string_view name)
+        {
+            for (const auto &entry : parameters)
+                if (model.text(entry.name) == name)
+                {
+                    const auto *value = std::get_if<T>(&entry.value);
+                    if (!value) throw std::runtime_error("CPU emit parameter has wrong type: " + std::string(name));
+                    return value;
+                }
+            return nullptr;
+        }
+
+        class Emitter
+        {
+        public:
+            explicit Emitter(const GrhSimModel &model)
+                : model_(model), mapping_(*model.cpuMapping()), layout_(*mapping_.dataLayout), schedule_(*mapping_.schedule),
+                  prefix_("grhsim_" + identifier(model.text(model.name()))), class_("GrhSIM_" + identifier(model.text(model.name()))),
+                  wordOffsets_(mapping_.partitionTree.partitions.size() + 1), armOffsets_(wordOffsets_.size()), frameSizes_(wordOffsets_.size()),
+                  activeOffsets_(wordOffsets_.size()), activeMasks_(wordOffsets_.size()), stateRanges_(model.states().size() + 1),
+                  projected_(stateRanges_.size()), fanout_(model.values().size() + 1), batchedHistories_(stateRanges_.size()),
+                  directCommitStates_(stateRanges_.size()), privateByteHistories_(stateRanges_.size())
+            {
+                for (const auto &frame : layout_.localFrames) frameSizes_[frame.owner.index] = frame.size;
+                for (const auto &op : model_.operations())
+                {
+                    if (model_.text(op.opType) == "core.compute.constant" && model_.results(op).size() == 1 &&
+                        type(model_.results(op)[0]).kind == TypeKind::String)
+                        staticStrings_.emplace(model_.results(op)[0].index, expression(op));
+                    if (model_.text(op.opType) == "core.system.task")
+                    {
+                        hasSystemTasks_ = true;
+                        const auto params = model_.parameters(op);
+                        const auto *proc = parameter<std::string>(model_, params, "proc_kind");
+                        const auto *timed = parameter<bool>(model_, params, "has_timing");
+                        if (proc && *proc == "initial" && timed && *timed)
+                            onceTasks_.emplace(op.id.index, onceTasks_.size());
+                    }
+                }
+                localStrings_.resize(frameSizes_.size());
+                for (const auto &entry : layout_.objects)
+                    if (layout_.types[entry.slot.type.index - 1].kind == CpuTypeKind::String)
+                        persistentStrings_.push_back({"cpu_objects.get()", entry.slot.offset});
+                for (std::size_t i = 0; i < layout_.values.size(); ++i)
+                {
+                    const auto &slot = layout_.values[i];
+                    if (layout_.types[slot.type.index - 1].kind == CpuTypeKind::String && !staticStrings_.contains(i + 1))
+                    {
+                        if (slot.kind == CpuStorageKind::Boundary)
+                            persistentStrings_.push_back({"cpu_boundary.get()", slot.offset});
+                        else localStrings_[slot.owner.index].push_back(slot.offset);
+                    }
+                }
+                for (const auto &shadow : schedule_.inputShadows)
+                    if (layout_.types[shadow.type.index - 1].kind == CpuTypeKind::String)
+                        persistentStrings_.push_back({"cpu_inputs.data()", shadow.offset});
+                for (const auto &slot : layout_.runtime)
+                    if (slot.kind == CpuRuntimeKind::ActiveWord) wordOffsets_[slot.owner.index] = slot.offset;
+                    else if (slot.kind == CpuRuntimeKind::DomainArm) armOffsets_[slot.owner.index] = slot.offset;
+                for (const auto &partition : mapping_.partitionTree.partitions)
+                    if (partition.attrs.activeId)
+                    {
+                        activeOffsets_[partition.id.index] = wordOffsets_[partition.parent.index];
+                        activeMasks_[partition.id.index] = 1u << (*partition.attrs.activeId % 8);
+                    }
+                for (const auto &row : schedule_.computeSupernodeFanout) fanout_[row.source.index] = &row.targets;
+                planReadAliases();
+                for (const auto &row : schedule_.commitStateFanout)
+                {
+                    auto &range = stateRanges_[row.source.index];
+                    range.offset = static_cast<uint32_t>(stateTargets_.size()); projected_[row.source.index] = true;
+                    std::map<uint32_t, uint32_t> masks;
+                    for (auto target : row.targets.activate)
+                        masks[activeOffsets_[target.index]] |= activeMasks_[target.index];
+                    for (auto target : aliasConsumers_[row.source.index])
+                        masks[activeOffsets_[target.index]] |= activeMasks_[target.index];
+                    for (auto [offset, mask] : masks) stateTargets_.push_back({offset, mask, false});
+                    for (auto target : row.targets.arm) stateTargets_.push_back({armOffsets_[target.index], 1, true});
+                    range.count = static_cast<uint32_t>(stateTargets_.size()) - range.offset;
+                }
+                planMemoryCells();
+            }
+
+            void planReadAliases()
+            {
+                readAliases_.resize(model_.values().size() + 1);
+                aliasConsumers_.resize(model_.states().size() + 1);
+                computeOwners_.resize(model_.operations().size() + 1);
+                const auto &tree = mapping_.partitionTree;
+                for (const auto &task : schedule_.numaNodes[0].cores[0].tasks)
+                    if (task.execution == CpuExecution::ActivityDrivenCompute)
+                        for (auto word : tree.partitions[task.partition.index - 1].children)
+                            for (auto unit : tree.partitions[word.index - 1].children)
+                                for (auto node : tree.partitions[unit.index - 1].children)
+                                    for (auto op : tree.partitions[node.index - 1].ops) computeOwners_[op.index] = unit;
+                std::vector<bool> snapshot(readAliases_.size());
+                std::vector<bool> projected(model_.states().size() + 1);
+                for (const auto &row : schedule_.commitStateFanout) projected[row.source.index] = true;
+                for (const auto &op : model_.operations())
+                    if (!computeOwners_[op.id.index])
+                        for (auto operand : model_.operands(op)) snapshot[operand.index] = true;
+                for (const auto &partition : tree.partitions)
+                    if (partition.attrs.eventGate)
+                        for (auto event : partition.attrs.eventGate->events) snapshot[event.value.index] = true;
+                for (const auto &op : model_.operations())
+                    if (model_.text(op.opType) == "core.state.read" && computeOwners_[op.id.index])
+                    {
+                        const auto result = model_.results(op)[0];
+                        const StateId source{model_.objectRefs(op)[0].index, 0};
+                        // Commit operands must retain their pre-commit snapshot, even for a single writer.
+                        if (projected[source.index] && !snapshot[result.index] && type(result).kind == TypeKind::Logic &&
+                            model_.values()[result.index - 1].type == model_.states()[source.index - 1].type)
+                            readAliases_[result.index] = source;
+                    }
+                for (const auto &op : model_.operations())
+                    for (auto operand : model_.operands(op))
+                        if (const auto source = readAliases_[operand.index])
+                            aliasConsumers_[source.index].push_back(computeOwners_[op.id.index]);
+                for (auto &consumers : aliasConsumers_)
+                {
+                    std::sort(consumers.begin(), consumers.end(), [](auto a, auto b) { return a.index < b.index; });
+                    consumers.erase(std::unique(consumers.begin(), consumers.end()), consumers.end());
+                }
+            }
+
+            void planMemoryCells()
+            {
+                memoryDirtyBases_.resize(model_.states().size() + 1);
+                memoryRanges_.resize(memoryDirtyBases_.size());
+                memoryReadIds_.resize(model_.operations().size() + 1);
+                dirtyBytes_ = model_.states().size() + 1;
+                std::vector<std::vector<OpId>> reads(memoryDirtyBases_.size());
+                for (const auto &op : model_.operations())
+                    if (model_.text(op.opType) == "core.state.memRead")
+                        reads[model_.objectRefs(op)[0].index].push_back(op.id);
+                for (const auto &state : model_.states())
+                {
+                    const auto &array = stateType(state.id);
+                    if (array.kind != TypeKind::Array) continue;
+                    memoryDirtyBases_[state.id.index] = dirtyBytes_;
+                    dirtyBytes_ += array.count;
+                    auto &range = memoryRanges_[state.id.index];
+                    range.offset = memoryReaders_.size();
+                    for (auto op : reads[state.id.index])
+                    {
+                        const auto owner = computeOwners_[op.index];
+                        if (!owner) throw std::runtime_error("CPU memory reader must be compute-owned");
+                        memoryReadIds_[op.index] = memoryReaders_.size() + 1;
+                        memoryReaders_.push_back({activeOffsets_[owner.index], activeMasks_[owner.index], false});
+                    }
+                    range.count = memoryReaders_.size() - range.offset;
+                }
+            }
+
+            void validate()
+            {
+                for (const auto &type : model_.types())
+                {
+                    if (type.kind == TypeKind::Logic &&
+                        type.domain != LogicDomain::TwoState)
+                        throw std::runtime_error("CPU C++ emit currently requires two-state logic types of at most 64 bits");
+                    if (type.kind == TypeKind::Array && containsString(type))
+                        throw std::runtime_error("CPU C++ emit arrays of string handles are not implemented");
+                }
+                for (const auto &state : model_.states())
+                    if (containsString(model_.types()[state.type.index - 1]))
+                        throw std::runtime_error("CPU C++ emit string state initialization and commit are not implemented");
+                std::set<std::string> names{
+                    class_, "init", "eval", "set_runtime_profile_enabled", "dump_runtime_profile", "cpu_at",
+                    "cpu_objects", "cpu_shadow", "cpu_boundary", "cpu_inputs", "cpu_strings", "cpu_bind_strings",
+                    "cpu_rng", "cpu_flags", "cpu_next_arms", "cpu_dirty", "Pending", "Target", "cpu_targets",
+                    "cpu_pending", "cpu_stage", "cpu_stage_bytes", "cpu_publish", "cpu_direct_again", "cpu_direct_state_changed",
+                    "cpu_bitwise_words_changed", "cpu_arithmetic_words_changed", "cpu_shift_words_changed", "cpu_active_word",
+                    "cpu_stage_cell", "cpu_memory_readers", "cpu_read_offsets"};
+                if (hasSystemTasks_)
+                    for (const auto *name : {"cpu_first_eval", "cpu_system_done", "cpu_strobes", "cpu_system_task"}) names.insert(name);
+                for (std::size_t i = 0; i < initChunkCount(); ++i) names.insert("cpu_init_" + std::to_string(i));
+                for (const auto &task : schedule_.numaNodes[0].cores[0].tasks) names.insert("cpu_task_" + std::to_string(task.id.index));
+                for (const auto &partition : mapping_.partitionTree.partitions)
+                    for (std::size_t i = 0; i < partition.attrs.helperChunks.size(); ++i)
+                        names.insert("cpu_helper_" + std::to_string(partition.id.index) + '_' + std::to_string(i));
+                for (const auto &input : model_.inputs()) validatePort(model_.text(input.name), names);
+                for (const auto &output : model_.outputs()) validatePort(model_.text(output.name), names);
+                std::map<std::string, std::string> declarations;
+                for (const auto &function : model_.functions())
+                {
+                    const auto symbol = identifier(model_.text(function.symbol));
+                    const auto declaration = dpiDeclaration(function);
+                    const auto [it, inserted] = declarations.emplace(symbol, declaration);
+                    if (!inserted && it->second != declaration)
+                        throw std::runtime_error("CPU DPI imports have conflicting C signatures: " + symbol);
+                }
+                for (const auto &op : model_.operations())
+                {
+                    const auto type = model_.text(op.opType);
+                    if (type == "core.state.regWrite" || type == "core.state.latchWrite" ||
+                        type == "core.state.memWrite" || type == "core.state.memWriteSeq" ||
+                        type == "core.state.memFill" || type == "core.state.memAssign") continue;
+                    if (type == "core.output.write") continue;
+                    if (type == "core.system.task") { validateSystemTask(op); continue; }
+                    if (type == "core.dpi.call") { validateDpiCall(op); continue; }
+                    if (model_.results(op).size() != 1) throw std::runtime_error("CPU C++ emit unsupported result arity: " + std::string(type));
+                    (void)expression(op);
+                }
+                struct DiscardBuffer : std::streambuf
+                {
+                    std::streamsize xsputn(const char *, std::streamsize count) override { return count; }
+                    int_type overflow(int_type ch) override { return traits_type::not_eof(ch); }
+                } buffer;
+                std::ostream discard(&buffer);
+                for (const auto &record : model_.initRecords())
+                {
+                    const auto &target = stateType(record.state);
+                    if (target.kind != TypeKind::Array && model_.steps(record).size() != 1)
+                        throw std::runtime_error("CPU scalar state requires exactly one full initializer");
+                    std::vector<std::pair<uint64_t, uint64_t>> covered;
+                    for (const auto &step : model_.steps(record)) initStep(discard, record.state, step, &covered);
+                    if (target.kind != TypeKind::Array) continue;
+                    std::sort(covered.begin(), covered.end());
+                    uint64_t end = 0;
+                    for (const auto &[first, last] : covered)
+                    {
+                        if (first > end) break;
+                        end = std::max(end, last);
+                    }
+                    if (end != target.count)
+                        throw std::runtime_error("CPU array initializer leaves uncovered rows: " + std::string(model_.text(model_.states()[record.state.index - 1].name)));
+                }
+                planDirectCommits();
+                planHistoryBatches();
+            }
+
+            std::string historyBatchSummary() const
+            {
+                return "history_candidates=" + std::to_string(historyCandidates_) +
+                    " history_private_rejected=" + std::to_string(historyPrivateRejected_) +
+                    " history_layout_rejected=" + std::to_string(historyLayoutRejected_) +
+                    " history_batch_states=" + std::to_string(historyBatchStates_) +
+                    " history_batches=" + std::to_string(historyBatchCount_) +
+                    " history_max_batch=" + std::to_string(historyMaxBatch_) +
+                    " history_max_pattern=" + std::to_string(historyMaxPattern_) +
+                    " direct_commit_states=" + std::to_string(directCommitCount_) +
+                    " state_read_aliases=" + std::to_string(std::count_if(readAliases_.begin(), readAliases_.end(), [](auto id) { return bool(id); })) +
+                    " memory_cell_readers=" + std::to_string(memoryReaders_.size());
+            }
+
+            PassResult write(const std::filesystem::path &directory)
+            {
+                if (std::filesystem::exists(directory) && !std::filesystem::is_empty(directory))
+                    throw std::runtime_error("CPU emit output directory must be empty: " + directory.string());
+                std::filesystem::create_directories(directory);
+                std::vector<std::string> artifacts, sources;
+                const auto file = [&](const std::string &name, const auto &callback) {
+                    const auto path = directory / name;
+                    std::ofstream out(path, std::ios::binary);
+                    if (!out) throw std::runtime_error("cannot create CPU artifact: " + path.string());
+                    callback(out); out.flush();
+                    if (!out) throw std::runtime_error("cannot write CPU artifact: " + path.string());
+                    artifacts.push_back(path.string());
+                };
+                file(prefix_ + "_runtime.hpp", [&](auto &out) { emit::writeGrhSimRuntime(out, {.systemTasks = hasSystemTasks_}); });
+                file(prefix_ + ".hpp", [&](auto &out) { header(out); });
+                const auto main = prefix_ + ".cpp"; sources.push_back(main);
+                file(main, [&](auto &out) { driver(out); });
+                constexpr std::size_t initChunkSteps = 4096;
+                std::size_t initChunk = 0;
+                std::size_t initSteps = 0;
+                for (const auto &record : model_.initRecords())
+                    for (const auto &step : model_.steps(record))
+                    {
+                        if (initSteps % initChunkSteps == 0)
+                        {
+                            const auto source = prefix_ + "_init_" + std::to_string(initChunk) + ".cpp";
+                            sources.push_back(source);
+                            file(source, [&](auto &out) { initBody(out, initChunk, initSteps); });
+                            ++initChunk;
+                        }
+                        ++initSteps;
+                    }
+                for (const auto &task : schedule_.numaNodes[0].cores[0].tasks)
+                {
+                    const auto source = prefix_ + "_task_" + std::to_string(task.id.index) + ".cpp";
+                    sources.push_back(source); file(source, [&](auto &out) { taskBody(out, task); });
+                }
+                file("Makefile", [&](auto &out) {
+                    out << "CXX ?= c++\nAR ?= ar\nCXXFLAGS ?= -std=c++20 -O3\nSOURCES :=";
+                    for (const auto &source : sources) out << ' ' << source;
+                    out << "\nOBJECTS := $(SOURCES:.cpp=.o)\nLIB := lib" << prefix_ << ".a\nall: $(LIB)\n"
+                        << "$(LIB): $(OBJECTS)\n\t$(AR) rcs $@ $^\n%.o: %.cpp " << prefix_ << ".hpp " << prefix_
+                        << "_runtime.hpp\n\t$(CXX) $(CXXFLAGS) -c $< -o $@\n.PHONY: all\n";
+                });
+                return {true, false, std::move(artifacts)};
+            }
+
+        private:
+            void planDirectCommits()
+            {
+                std::vector<uint32_t> references(model_.states().size() + 1), allowed(references.size()), writers(references.size());
+                for (auto ref : model_.objectRefPool())
+                    if (ref.kind == ObjectKind::State) ++references[ref.index];
+                for (const auto &op : model_.operations())
+                {
+                    const auto name = model_.text(op.opType);
+                    const auto refs = model_.objectRefs(op);
+                    if (name == "core.state.read")
+                        for (auto ref : refs) ++allowed[ref.index];
+                    else if (name == "core.state.regWrite" || name == "core.state.latchWrite")
+                    {
+                        ++allowed[refs.front().index];
+                        ++writers[refs.front().index];
+                    }
+                }
+                for (const auto &state : model_.states())
+                {
+                    const auto &type = stateType(state.id);
+                    if (writers[state.id.index] == 1 && references[state.id.index] == allowed[state.id.index] &&
+                        type.kind == TypeKind::Logic && type.domain == LogicDomain::TwoState && type.width > 0 && type.width <= 64)
+                    {
+                        directCommitStates_[state.id.index] = true;
+                        ++directCommitCount_;
+                    }
+                }
+            }
+
+            struct HistoryBatch
+            {
+                StateId first;
+                uint64_t offset = 0;
+                std::size_t count = 0;
+                std::vector<ValueId> pattern;
+            };
+
+            void planHistoryBatches()
+            {
+                std::vector<uint32_t> references(model_.states().size() + 1);
+                for (auto ref : model_.objectRefPool())
+                    if (ref.kind == ObjectKind::State) ++references[ref.index];
+                struct Sample { StateId state; ValueId value; uint64_t offset; };
+                const auto &tree = mapping_.partitionTree;
+                for (const auto &task : schedule_.numaNodes[0].cores[0].tasks)
+                {
+                    if (task.execution == CpuExecution::ActivityDrivenCompute) continue;
+                    const auto &function = tree.partitions[task.partition.index - 1];
+                    if (!tree.partitions[function.parent.index - 1].attrs.eventGate) continue;
+                    const auto arm = armOffsets_[function.parent.index];
+                    std::vector<Sample> samples;
+                    for (auto unit : function.children)
+                        for (auto id : tree.partitions[unit.index - 1].ops)
+                        {
+                            const auto &op = model_.operations()[id.index - 1];
+                            const auto *edges = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
+                            if (!edges) continue;
+                            const auto events = model_.operands(op).last(edges->size());
+                            const auto refs = model_.objectRefs(op).last(edges->size());
+                            for (std::size_t i = 0; i < events.size(); ++i)
+                            {
+                                ++historyCandidates_;
+                                const StateId history{refs[i].index, refs[i].generation};
+                                if (references[history.index] != 1) { ++historyPrivateRejected_; continue; }
+                                const auto &type = stateType(history);
+                                const auto &slot = object(refs[i]);
+                                const auto range = stateRanges_[history.index];
+                                privateByteHistories_[history.index] = type.kind == TypeKind::Logic && type.width == 1 &&
+                                    !type.isSigned && type.domain == LogicDomain::TwoState && layout_.types[slot.type.index - 1].size == 1;
+                                if (type.kind != TypeKind::Logic || type.width != 1 || type.domain != LogicDomain::TwoState ||
+                                    model_.states()[history.index - 1].type != model_.values()[events[i].index - 1].type ||
+                                    layout_.types[slot.type.index - 1].size != 1 || !projected_[history.index] || range.count != 1 ||
+                                    !stateTargets_[range.offset].arm || stateTargets_[range.offset].offset != arm)
+                                { ++historyLayoutRejected_; continue; }
+                                samples.push_back({history, events[i], slot.offset});
+                            }
+                        }
+                    std::sort(samples.begin(), samples.end(), [](const auto &a, const auto &b) { return a.offset < b.offset; });
+                    for (std::size_t first = 0; first < samples.size();)
+                    {
+                        std::size_t end = first + 1;
+                        while (end < samples.size() && samples[end].offset == samples[end - 1].offset + 1) ++end;
+                        while (first < end)
+                        {
+                            std::size_t count = 0, period = 0;
+                            for (std::size_t p = 1; p <= 8 && p <= (end - first) / 2; ++p)
+                            {
+                                std::size_t n = p;
+                                while (first + n < end && samples[first + n].value == samples[first + n % p].value) ++n;
+                                n -= n % p;
+                                if (n > count) { count = n; period = p; }
+                            }
+                            if (count < 4) { ++first; continue; }
+                            HistoryBatch batch{samples[first].state, samples[first].offset, count, {}};
+                            for (std::size_t i = 0; i < period; ++i) batch.pattern.push_back(samples[first + i].value);
+                            for (std::size_t i = 0; i < count; ++i) batchedHistories_[samples[first + i].state.index] = true;
+                            historyBatches_[task.id.index].push_back(std::move(batch));
+                            historyBatchStates_ += count; ++historyBatchCount_;
+                            historyMaxBatch_ = std::max<uint64_t>(historyMaxBatch_, count);
+                            historyMaxPattern_ = std::max<uint64_t>(historyMaxPattern_, period);
+                            first += count;
+                        }
+                    }
+                }
+            }
+
+            void sampleHistoryBatch(std::ostream &out, const HistoryBatch &batch) const
+            {
+                const auto range = stateRanges_[batch.first.index];
+                out << "{ // cpu_history_batch states=" << batch.count << "\n"
+                    << "auto *cpu_history=cpu_stage_bytes(" << batch.first.index << ',' << batch.offset << ',' << batch.count
+                    << ',' << range.offset << ',' << range.count << ",true);\n";
+                if (batch.pattern.size() == 1)
+                    out << "std::memset(cpu_history,static_cast<unsigned char>(" << value(batch.pattern.front()) << ")," << batch.count << ");\n";
+                else
+                {
+                    out << "const unsigned char cpu_pattern[]={";
+                    for (std::size_t i = 0; i < batch.pattern.size(); ++i)
+                        out << (i ? "," : "") << "static_cast<unsigned char>(" << value(batch.pattern[i]) << ')';
+                    out << "};\nfor(std::size_t i=0;i<" << batch.count << ";i+=" << batch.pattern.size()
+                        << ")std::memcpy(cpu_history+i,cpu_pattern," << batch.pattern.size() << ");\n";
+                }
+                out << "}\n";
+            }
+
+            void validatePort(std::string_view name, std::set<std::string> &names)
+            {
+                const auto cpp = identifier(name);
+                if (!names.insert(cpp).second)
+                    throw std::runtime_error("CPU port name collides with generated member: " + cpp);
+            }
+
+            const Type &type(ValueId value) const { return model_.types()[model_.values()[value.index - 1].type.index - 1]; }
+            const Type &stateType(StateId state) const { return model_.types()[model_.states()[state.index - 1].type.index - 1]; }
+            bool containsString(const Type &type) const
+            {
+                return type.kind == TypeKind::String || (type.kind == TypeKind::Array &&
+                    containsString(model_.types()[type.elementType.index - 1]));
+            }
+            std::string cppType(const Type &type) const
+            {
+                if (type.kind == TypeKind::Array)
+                    return "std::array<" + cppType(model_.types()[type.elementType.index - 1]) + "," + std::to_string(type.count) + ">";
+                if (type.kind == TypeKind::String)
+                    return "std::string";
+                if (type.kind == TypeKind::Real) return "double";
+                if (type.kind != TypeKind::Logic)
+                    throw std::runtime_error("CPU C++ emit non-logic scalar storage is not implemented");
+                if (type.domain != LogicDomain::TwoState || type.width == 0 || type.width > 64)
+                {
+                    if (type.domain != LogicDomain::TwoState || type.width == 0)
+                        throw std::runtime_error("CPU C++ emit scalar logic width/domain is not implemented");
+                    return "std::array<std::uint64_t," + std::to_string((type.width + 63u) / 64u) + ">";
+                }
+                if (type.width == 1 && !type.isSigned) return "bool";
+                return "std::" + std::string(type.isSigned ? "int" : "uint") +
+                       std::to_string(type.width <= 8 ? 8 : type.width <= 16 ? 16 : type.width <= 32 ? 32 : 64) + "_t";
+            }
+            uint64_t storageBytes(const Type &type) const
+            {
+                if (type.kind == TypeKind::Array)
+                    return storageBytes(model_.types()[type.elementType.index - 1]) * type.count;
+                if (type.kind != TypeKind::Logic || type.width == 0 || type.domain != LogicDomain::TwoState)
+                    throw std::runtime_error("CPU C++ emit requires two-state logic storage");
+                return type.width > 64 ? ((uint64_t(type.width) + 63u) / 64u) * 8u :
+                       type.width <= 8 ? 1 : type.width <= 16 ? 2 : type.width <= 32 ? 4 : 8;
+            }
+            std::string normalize(std::string expression, const Type &type) const
+            {
+                if (type.kind == TypeKind::String || type.kind == TypeKind::Real)
+                    return expression;
+                if (type.kind == TypeKind::Logic && type.domain == LogicDomain::TwoState && type.width > 64)
+                    return expression;
+                return "static_cast<" + cppType(type) + ">(" + (type.isSigned ? "grhsim_sign_extend_i64(" : "grhsim_trunc_u64(") +
+                       expression + "," + std::to_string(type.width) + "))";
+            }
+            std::string at(const Type &type, std::string_view arena, uint64_t offset) const
+            { return "cpu_at<" + cppType(type) + ">(" + std::string(arena) + "," + std::to_string(offset) + ")"; }
+            std::string value(ValueId value) const
+            {
+                if (!readAliases_.empty() && readAliases_[value.index]) return state(readAliases_[value.index]);
+                if (type(value).kind == TypeKind::String)
+                    if (const auto it = staticStrings_.find(value.index); it != staticStrings_.end()) return it->second;
+                const auto &slot = layout_.values[value.index - 1];
+                return at(type(value), slot.kind == CpuStorageKind::Boundary ? "cpu_boundary.get()" : "cpu_local", slot.offset);
+            }
+            const CpuDataSlot &object(ObjectRef ref) const
+            {
+                const auto index = ref.kind == ObjectKind::Input ? ref.index - 1 : ref.kind == ObjectKind::Output ?
+                    model_.inputs().size() + ref.index - 1 : model_.inputs().size() + model_.outputs().size() + ref.index - 1;
+                return layout_.objects[index].slot;
+            }
+            std::string state(StateId state) const
+            { return at(stateType(state), "cpu_objects.get()", object(ObjectRef::state(state)).offset); }
+            std::string literal(std::string_view text, const Type &type) const
+            {
+                auto parsed = [&]() {
+                    try { return slang::SVInt::fromString(text).resize(type.width); }
+                    catch (const std::exception &) { throw std::runtime_error("CPU C++ emit unsupported constant literal: " + std::string(text)); }
+                }();
+                parsed.flattenUnknowns(); const auto bits = parsed.as<uint64_t>();
+                if (type.kind == TypeKind::Logic && type.domain == LogicDomain::TwoState && type.width > 64)
+                {
+                    const auto words = (type.width + 63u) / 64u;
+                    std::string result = "std::array<std::uint64_t," + std::to_string(words) + ">{";
+                    const auto *raw = parsed.getRawPtr();
+                    for (uint32_t i = 0; i < words; ++i)
+                        result += (i ? "," : "") + std::string("UINT64_C(") + std::to_string(raw[i]) + ")";
+                    return result + "}";
+                }
+                if (!bits) throw std::runtime_error("cannot encode CPU scalar literal");
+                return normalize("UINT64_C(" + std::to_string(*bits) + ")", type);
+            }
+            std::string initLiteral(std::string_view text, const Type &type) const
+            {
+                // Lowering uses bare x for the two-state projection of an unspecified memory.
+                if (text == "x" || text == "X" || text == "z" || text == "Z" ||
+                    text == "'x" || text == "'X" || text == "'z" || text == "'Z" || text == "'0") text = "0";
+                else if (text == "'1") text = "-1";
+                return literal(text, type);
+            }
+
+            void randomInit(std::ostream &out, const Type &type, std::string_view destination, std::string_view rng) const
+            {
+                if (type.width <= 64)
+                    out << destination << '=' << normalize("grhsim_random_u64(" + std::string(rng) + "," + std::to_string(type.width) + ")", type) << ";\n";
+                else
+                {
+                    out << "for(std::size_t w=0;w<" << (type.width + 63u) / 64u << ";++w) " << destination
+                        << "[w]=grhsim_splitmix64_next(" << rng << ");\n"
+                        << "grhsim_trunc_words(" << destination << ',' << type.width << ");\n";
+                }
+            }
+
+            using InitRows = std::vector<std::pair<uint64_t, std::string>>;
+            mutable std::map<const InitStep *, InitRows> readmemRows_;
+
+            const InitRows &readmemRows(const InitStep &step, const Type &element, uint64_t first, uint64_t end) const
+            {
+                if (const auto found = readmemRows_.find(&step); found != readmemRows_.end()) return found->second;
+                const auto params = model_.parameters(step);
+                const auto *file = parameter<std::string>(model_, params, "file"), *format = parameter<std::string>(model_, params, "format");
+                if (!file || file->empty() || !format || (*format != "hex" && *format != "bin"))
+                    throw std::runtime_error("CPU readmem requires file and hex/bin format");
+                std::ifstream stream(*file, std::ios::binary);
+                if (!stream) throw std::runtime_error("CPU readmem failed to open: " + *file);
+                const std::string text{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+                if (stream.bad()) throw std::runtime_error("CPU readmem failed to read: " + *file);
+                std::vector<std::string> tokens;
+                std::string error;
+                if (!emit::tokenizeReadmemText(text, tokens, error)) throw std::runtime_error(*file + ": " + error);
+                InitRows rows;
+                uint64_t row = first;
+                for (const auto &token : tokens)
+                {
+                    if (token.front() == '@')
+                    {
+                        const auto address = emit::parseReadmemAddress(std::string_view(token).substr(1));
+                        if (!address) throw std::runtime_error("CPU readmem invalid address: " + token + " in " + *file);
+                        row = *address;
+                        continue;
+                    }
+                    bool hasDigit = false;
+                    for (const char ch : token)
+                    {
+                        if (ch == '_') continue;
+                        const bool valid = ch == '0' || ch == '1' || ch == 'x' || ch == 'X' || ch == 'z' || ch == 'Z' || ch == '?' ||
+                            (*format == "hex" && ((ch >= '2' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')));
+                        if (!valid) throw std::runtime_error("CPU readmem invalid data: " + token + " in " + *file);
+                        hasDigit = true;
+                    }
+                    if (!hasDigit) throw std::runtime_error("CPU readmem empty data token in " + *file);
+                    if (row >= first && row < end)
+                        rows.emplace_back(row, literal(std::to_string(element.width) + (*format == "hex" ? "'h" : "'b") + token, element));
+                    if (row != std::numeric_limits<uint64_t>::max()) ++row;
+                }
+                return readmemRows_.emplace(&step, std::move(rows)).first->second;
+            }
+
+            void initStep(std::ostream &out, StateId id, const InitStep &step,
+                          std::vector<std::pair<uint64_t, uint64_t>> *covered = nullptr) const
+            {
+                const auto &target = stateType(id);
+                const bool array = target.kind == TypeKind::Array;
+                const auto &element = array ? model_.types()[target.elementType.index - 1] : target;
+                if (element.kind != TypeKind::Logic || element.domain != LogicDomain::TwoState)
+                    throw std::runtime_error("CPU initializer currently requires two-state logic or an array of two-state logic");
+                const auto kind = model_.text(step.kind);
+                const auto params = model_.parameters(step);
+                const auto offset = object(ObjectRef::state(id)).offset;
+                out << "{\n";
+                if (!array)
+                {
+                    if (kind == "core.init.const")
+                    {
+                        const auto *text = parameter<std::string>(model_, params, "value");
+                        if (!text) throw std::runtime_error("CPU scalar initializer requires value literal");
+                        const auto expression = initLiteral(*text, element);
+                        if (element.width <= 64) out << state(id) << '=' << expression << ";\n";
+                        else out << "static const auto data=" << expression << ";\nstd::memcpy(cpu_objects.get()+" << offset << ",&data,sizeof(data));\n";
+                    }
+                    else if (kind == "core.init.random")
+                    {
+                        const auto *seed = parameter<int64_t>(model_, params, "seed");
+                        if (seed) out << "std::uint64_t rng=UINT64_C(" << static_cast<uint64_t>(*seed) << ");\n";
+                        randomInit(out, element, state(id), seed ? "rng" : "cpu_rng");
+                    }
+                    else throw std::runtime_error("CPU scalar initializer must be const or random");
+                    out << "}\n";
+                    return;
+                }
+
+                if (kind == "core.init.const")
+                {
+                    const auto *values = parameter<std::vector<std::string>>(model_, params, "value");
+                    if (!values || values->size() != target.count)
+                        throw std::runtime_error("CPU array const initializer requires exactly count element literals");
+                    if (!values->empty())
+                    {
+                        out << "static const " << cppType(element) << " data[]={\n";
+                        for (const auto &text : *values) out << initLiteral(text, element) << ",\n";
+                        out << "};\nstd::memcpy(cpu_objects.get()+" << offset << ",data,sizeof(data));\n";
+                    }
+                    if (covered) covered->emplace_back(0, target.count);
+                }
+                else if (kind == "core.init.fill" || kind == "core.init.readmem")
+                {
+                    const auto *start = parameter<int64_t>(model_, params, "start"), *count = parameter<int64_t>(model_, params, "count");
+                    if ((start && (*start < 0 || uint64_t(*start) > target.count)) || (count && *count < 0))
+                        throw std::runtime_error("CPU array initializer range is invalid");
+                    const auto first = start ? uint64_t(*start) : 0;
+                    const auto size = count ? uint64_t(*count) : target.count - first;
+                    if (size > target.count - first) throw std::runtime_error("CPU array initializer range exceeds state");
+                    const auto end = first + size;
+                    const auto rowBytes = storageBytes(element);
+                    if (kind == "core.init.fill")
+                    {
+                        const auto *text = parameter<std::string>(model_, params, "value");
+                        const auto *random = parameter<bool>(model_, params, "random");
+                        if ((!text && !(random && *random)) || (text && random))
+                            throw std::runtime_error("CPU array fill requires exactly one of value or random=true");
+                        const bool zero = text && (initLiteral(*text, element) == literal("0", element));
+                        if (zero)
+                            out << "std::memset(cpu_objects.get()+" << offset + first * rowBytes << ",0," << size * rowBytes << ");\n";
+                        else
+                        {
+                            if (text) out << "static const auto data=" << initLiteral(*text, element) << ";\n";
+                            out << "for(std::size_t row=" << first << ";row<" << end << ";++row){\n"
+                                << "auto &dst=cpu_at<" << cppType(element) << ">(cpu_objects.get()," << offset << "+row*" << rowBytes << ");\n";
+                            if (text) out << "std::memcpy(&dst,&data,sizeof(data));\n";
+                            else randomInit(out, element, "dst", "cpu_rng");
+                            out << "}\n";
+                        }
+                        if (covered) covered->emplace_back(first, end);
+                    }
+                    else
+                    {
+                        const auto &rows = readmemRows(step, element, first, end);
+                        if (!rows.empty())
+                        {
+                            out << "static const std::size_t rows[]={";
+                            for (const auto &[row, data] : rows) out << row << ',';
+                            out << "};\nstatic const " << cppType(element) << " data[]={\n";
+                            for (const auto &[row, data] : rows) out << data << ",\n";
+                            out << "};\nfor(std::size_t i=0;i<" << rows.size() << ";++i)std::memcpy(cpu_objects.get()+"
+                                << offset << "+rows[i]*" << rowBytes << ",&data[i],sizeof(data[i]));\n";
+                        }
+                        if (covered) for (const auto &[row, data] : rows) covered->emplace_back(row, row + 1);
+                    }
+                }
+                else throw std::runtime_error("CPU C++ emit unsupported array initializer: " + std::string(kind));
+                out << "}\n";
+            }
+            std::string expression(const SimOp &op) const
+            {
+                const auto name = model_.text(op.opType); const auto operands = model_.operands(op);
+                const auto &result = type(model_.results(op)[0]); const auto width = result.width;
+                const auto raw = [&](std::size_t i) { if (i >= operands.size()) throw std::runtime_error("CPU op operand arity"); return value(operands[i]); };
+                const auto cast = [&](std::size_t i, uint32_t width) {
+                    const auto expr = raw(i); const auto &source = type(operands[i]);
+                    return "grhsim_cast_u64(" + expr + "," + std::to_string(source.width) + "," + std::to_string(width) +
+                           "," + (source.isSigned ? "true" : "false") + ")";
+                };
+                const auto number = [&](std::string_view key) {
+                    const auto *n = parameter<int64_t>(model_, model_.parameters(op), key);
+                    if (!n || *n < 0) throw std::runtime_error("missing or negative CPU slice/replication parameter");
+                    return static_cast<uint64_t>(*n);
+                };
+                if (name == "core.input.read") return at(result, "cpu_objects.get()", object(model_.objectRefs(op)[0]).offset);
+                if (name == "core.state.read") return state({model_.objectRefs(op)[0].index, 0});
+                if (name == "core.state.memRead")
+                {
+                    const auto refs = model_.objectRefs(op);
+                    if (refs.size() != 1 || refs[0].kind != ObjectKind::State)
+                        throw std::runtime_error("CPU memory read requires one array state reference");
+                    const auto &array = stateType({refs[0].index, 0});
+                    if (array.kind != TypeKind::Array)
+                        throw std::runtime_error("CPU memory read target is not an array state");
+                    const auto &element = model_.types()[array.elementType.index - 1];
+                    if (operands.size() != 1)
+                        throw std::runtime_error("CPU memory read requires one index operand");
+                    return "cpu_at<" + cppType(element) + ">(cpu_objects.get()," +
+                           std::to_string(object(refs[0]).offset) + "+(" + raw(0) + ")*" +
+                           std::to_string(storageBytes(element)) + ")";
+                }
+                if (name == "core.compute.constant")
+                {
+                    const auto params = model_.parameters(op);
+                    const auto *text = parameter<std::string>(model_, params, "value");
+                    if (!text) text = parameter<std::string>(model_, params, "constValue");
+                    if (result.kind == TypeKind::String)
+                    {
+                        if (!text) return "std::string{}";
+                        std::string escaped;
+                        escaped.reserve(text->size());
+                        for (const char ch : *text)
+                        {
+                            switch (ch)
+                            {
+                            case '\\': escaped += "\\\\"; break;
+                            case '"': escaped += "\\\""; break;
+                            case '\n': escaped += "\\n"; break;
+                            case '\r': escaped += "\\r"; break;
+                            case '\t': escaped += "\\t"; break;
+                            default: escaped += ch; break;
+                            }
+                        }
+                        return "std::string(\"" + escaped + "\")";
+                    }
+                    if (result.kind != TypeKind::Logic)
+                        throw std::runtime_error("CPU C++ emit non-logic constant is not implemented");
+                    if (text) return literal(*text, result);
+                    const auto *integer = parameter<int64_t>(model_, params, "value");
+                    if (!integer) integer = parameter<int64_t>(model_, params, "constValue");
+                    if (integer) return literal(std::to_string(*integer), result);
+                    const auto *boolean = parameter<bool>(model_, params, "value");
+                    if (!boolean) boolean = parameter<bool>(model_, params, "constValue");
+                    if (boolean) return literal(*boolean ? "1" : "0", result);
+                    throw std::runtime_error("CPU constant requires value literal");
+                }
+                if (!name.starts_with("core.compute.")) throw std::runtime_error("CPU C++ emit unsupported operation: " + std::string(name));
+                const auto kind = name.substr(13);
+                if (width > 64)
+                {
+                    const auto words = std::to_string((width + 63u) / 64u);
+                    if (kind == "assign") return raw(0);
+                    if (kind == "and" || kind == "or" || kind == "xor" || kind == "xnor")
+                        return "grhsim_" + std::string(kind) + "_words(" + raw(0) + "," + raw(1) + "," + std::to_string(width) + ")";
+                    if (kind == "not") return "grhsim_not_words(" + raw(0) + "," + std::to_string(width) + ")";
+                    if (kind == "mux") return "grhsim_mux_words(" + raw(0) + "," + raw(1) + "," + raw(2) + "," + std::to_string(width) + ")";
+                    if (kind == "shl" || kind == "lshr" || kind == "ashr")
+                        return "grhsim_" + std::string(kind) + "_words(" + raw(0) + "," + raw(1) + "," + std::to_string(width) + ")";
+                    if (kind == "add" || kind == "sub")
+                        return "grhsim_" + std::string(kind) + "_words(" + raw(0) + "," + raw(1) + "," + std::to_string(width) + ")";
+                    if (kind == "replicate")
+                        return "grhsim_replicate_words<" + words + "," + std::to_string((type(operands[0]).width + 63u) / 64u) + ">( " + raw(0) + "," +
+                               std::to_string(type(operands[0]).width) + "," + std::to_string(number("rep")) + "," + std::to_string(width) + ")";
+                    if (kind == "concat" && operands.size() >= 2)
+                    {
+                        std::string joined = raw(0); uint64_t joinedWidth = type(operands[0]).width;
+                        for (std::size_t i = 1; i < operands.size(); ++i)
+                        {
+                            const auto rhsWidth = type(operands[i]).width;
+                            if (joinedWidth <= 64 && rhsWidth <= 64 && joinedWidth + rhsWidth > 64)
+                                joined = "grhsim_concat_scalar_scalar_wide<" + words + ">( " + joined + "," + std::to_string(joinedWidth) + "," + raw(i) + "," +
+                                         std::to_string(rhsWidth) + "," + std::to_string(std::min<uint32_t>(width, joinedWidth + rhsWidth)) + ")";
+                            else if (joinedWidth <= 64 && rhsWidth <= 64)
+                                joined = "grhsim_concat_u64(" + joined + "," + std::to_string(joinedWidth) + "," + raw(i) + "," +
+                                         std::to_string(rhsWidth) + ")";
+                            else if (rhsWidth <= 64)
+                                joined = "grhsim_concat_wide_scalar<" + words + ">( " + joined + "," + std::to_string(joinedWidth) + "," +
+                                         raw(i) + "," + std::to_string(rhsWidth) + "," + std::to_string(std::min<uint32_t>(width, joinedWidth + rhsWidth)) + ")";
+                            else if (joinedWidth <= 64)
+                                joined = "grhsim_concat_scalar_wide<" + words + "," + std::to_string((rhsWidth + 63u) / 64u) + ">( " + joined + "," +
+                                         std::to_string(joinedWidth) + "," + raw(i) + "," + std::to_string(rhsWidth) + "," +
+                                         std::to_string(std::min<uint32_t>(width, joinedWidth + rhsWidth)) + ")";
+                            else
+                                joined = "grhsim_concat_words<" + words + ">( " + joined + "," + std::to_string(joinedWidth) + "," + raw(i) + "," +
+                                         std::to_string(rhsWidth) + "," + std::to_string(std::min<uint32_t>(width, joinedWidth + rhsWidth)) + ")";
+                            joinedWidth += type(operands[i]).width;
+                        }
+                        return joined;
+                    }
+                    if ((kind == "sliceStatic" || kind == "sliceDynamic") && type(operands[0]).width > 64)
+                    {
+                        const auto srcWords = (type(operands[0]).width + 63u) / 64u;
+                        const auto start = kind == "sliceStatic" ? std::to_string(number("sliceStart")) : raw(1);
+                        return "grhsim_slice_words<" + words + "," + std::to_string(srcWords) + ">( " + raw(0) + "," + start + "," + std::to_string(width) + ")";
+                    }
+                    if (kind == "sliceArray" && type(operands[0]).width > 64)
+                    {
+                        const auto srcWords = (type(operands[0]).width + 63u) / 64u;
+                        return "grhsim_slice_words<" + words + "," + std::to_string(srcWords) + ">( " + raw(0) + ",(" + raw(1) + ")*" +
+                               std::to_string(width) + "," + std::to_string(width) + ")";
+                    }
+                    throw std::runtime_error("CPU C++ emit unsupported wide operation: " + std::string(kind) + " width=" + std::to_string(width));
+                }
+                if (kind == "assign") return cast(0, width);
+                static const std::map<std::string_view, std::string_view> binary{
+                    {"add", "+"}, {"sub", "-"}, {"mul", "*"}, {"and", "&"}, {"or", "|"}, {"xor", "^"},
+                    {"logicAnd", "&&"}, {"logicOr", "||"}};
+                if (auto it = binary.find(kind); it != binary.end())
+                    return "(" + (kind.starts_with("logic") ? raw(0) : cast(0, width)) + std::string(it->second) +
+                           (kind.starts_with("logic") ? raw(1) : cast(1, width)) + ")";
+                if (kind == "not" || kind == "logicNot") return "(" + std::string(kind == "not" ? "~" : "!") + raw(0) + ")";
+                if (kind == "xnor") return "~(" + cast(0, width) + "^" + cast(1, width) + ")";
+                if (kind == "mux") return "(" + raw(0) + "?" + cast(1, width) + ":" + cast(2, width) + ")";
+                if (kind == "shl" || kind == "lshr" || kind == "ashr")
+                    return "grhsim_" + std::string(kind) + "_u64(" + cast(0, width) + ",grhsim_index_words(" + raw(1) + "," + std::to_string(width) + ")," + std::to_string(width) + ")";
+                if (kind == "div" || kind == "mod")
+                    return "grhsim_" + std::string(type(operands[0]).isSigned && type(operands[1]).isSigned ? "s" : "u") +
+                           std::string(kind) + "_u64(" + cast(0, width) + "," + cast(1, width) + "," + std::to_string(width) + ")";
+                static const std::map<std::string_view, std::string_view> compares{
+                    {"eq", "=="}, {"ne", "!="}, {"caseEq", "=="}, {"caseNe", "!="},
+                    {"wildcardEq", "=="}, {"wildcardNe", "!="}, {"lt", "<"}, {"le", "<="}, {"gt", ">"}, {"ge", ">="}};
+                if (auto it = compares.find(kind); it != compares.end())
+                {
+                    const auto compareWidth = std::max(type(operands[0]).width, type(operands[1]).width);
+                    if (compareWidth > 64)
+                    {
+                        std::string prefix = "([&](){";
+                        std::array<std::string, 2> pointers;
+                        for (std::size_t i = 0; i < 2; ++i)
+                        {
+                            if (type(operands[i]).width > 64) pointers[i] = "(" + raw(i) + ").data()";
+                            else
+                            {
+                                const auto local = "cpu_cmp_" + std::to_string(i);
+                                prefix += "const std::uint64_t " + local + "=static_cast<std::uint64_t>(" + raw(i) + ");";
+                                pointers[i] = "&" + local;
+                            }
+                        }
+                        return prefix + "return grhsim_compare_extended_words(" + pointers[0] + "," +
+                            std::to_string((type(operands[0]).width + 63u) / 64u) + "," + std::to_string(type(operands[0]).width) + "," +
+                            pointers[1] + "," + std::to_string((type(operands[1]).width + 63u) / 64u) + "," +
+                            std::to_string(type(operands[1]).width) + "," +
+                            (type(operands[0]).isSigned && type(operands[1]).isSigned ? "true" : "false") + ")" +
+                            std::string(it->second) + "0;}())";
+                    }
+                    return "(grhsim_compare_" + std::string(type(operands[0]).isSigned && type(operands[1]).isSigned ? "signed" : "unsigned") +
+                           "_u64(" + cast(0, compareWidth) + "," + cast(1, compareWidth) + "," + std::to_string(compareWidth) + ")" +
+                           std::string(it->second) + "0)";
+                }
+                static const std::map<std::string_view, std::string_view> reduces{
+                    {"reduceAnd", "and"}, {"reduceNand", "nand"}, {"reduceOr", "or"}, {"reduceNor", "nor"},
+                    {"reduceXor", "xor"}, {"reduceXnor", "xnor"}};
+                if (auto it = reduces.find(kind); it != reduces.end())
+                {
+                    const auto operandWidth = type(operands[0]).width;
+                    if (operandWidth > 64)
+                        return "grhsim_reduce_" + std::string(it->second) + "_words(" + raw(0) + "," + std::to_string(operandWidth) + ")";
+                    return "grhsim_reduce_" + std::string(it->second) + "_u64(" + raw(0) + "," + std::to_string(operandWidth) + ")";
+                }
+                if (kind == "sliceStatic" || kind == "sliceDynamic" || kind == "sliceArray")
+                {
+                    if (type(operands[0]).width > 64)
+                    {
+                        const auto srcWords = (type(operands[0]).width + 63u) / 64u;
+                        std::string start = kind == "sliceStatic" ? std::to_string(number("sliceStart")) : cast(1, type(operands[1]).width);
+                        if (kind == "sliceArray") start = "(" + start + ")*" + std::to_string(width);
+                        return "grhsim_slice_words_u64<" + std::to_string(srcWords) + ">( " + raw(0) + "," + start + "," + std::to_string(width) + ")";
+                    }
+                    std::string start = kind == "sliceStatic" ? std::to_string(number("sliceStart")) : cast(1, type(operands[1]).width);
+                    if (kind == "sliceArray")
+                        start = "(" + start + ">=64/" + std::to_string(width) + "+1?64:" + start + "*" + std::to_string(width) + ")";
+                    return "grhsim_slice_dynamic_u64(grhsim_trunc_u64(" + raw(0) + "," + std::to_string(type(operands[0]).width) +
+                           ")," + start + "," + std::to_string(width) + ")";
+                }
+                if (kind == "concat" || kind == "replicate")
+                {
+                    std::string expr = "UINT64_C(0)"; uint64_t total = 0;
+                    const auto count = kind == "replicate" ? number("rep") : operands.size();
+                    if (!count || count > 64) throw std::runtime_error("invalid CPU scalar concatenation/replication count");
+                    for (uint64_t i = 0; i < count; ++i)
+                    {
+                        const auto index = kind == "replicate" ? 0 : i;
+                        expr = "grhsim_concat_u64(" + expr + "," + std::to_string(total) + "," + raw(index) + "," +
+                               std::to_string(type(operands[index]).width) + ")";
+                        total += type(operands[index]).width;
+                    }
+                    return expr;
+                }
+                throw std::runtime_error("CPU C++ emit unsupported computation: " + std::string(kind));
+            }
+
+            void activate(std::ostream &out, const CpuActivationTargets &targets, bool next, PartitionId activeUnit = {},
+                          const std::string &condition = {}) const
+            {
+                std::map<uint32_t, uint32_t> masks;
+                uint32_t localMask = 0;
+                for (auto target : targets.activate)
+                {
+                    const auto offset = activeOffsets_[target.index], mask = activeMasks_[target.index];
+                    // As in legacy, later bits can run now; earlier/current bits remain queued.
+                    if (activeUnit && offset == activeOffsets_[activeUnit.index] && mask > activeMasks_[activeUnit.index])
+                        localMask |= mask;
+                    else masks[offset] |= mask;
+                }
+                const auto gated = [&](uint32_t mask) {
+                    return condition.empty() ? std::to_string(mask) :
+                        "(static_cast<std::uint8_t>(-static_cast<std::uint8_t>(" + condition + ")) & " + std::to_string(mask) + ")";
+                };
+                if (localMask) out << "cpu_active_word |= " << gated(localMask) << ";\n";
+                for (const auto &[offset, mask] : masks)
+                    out << "cpu_flags[" << offset << "] |= " << gated(mask) << ";\n";
+                for (auto target : targets.arm)
+                    out << (next ? "cpu_next_arms[" : "cpu_flags[") << armOffsets_[target.index] << "] |= " << gated(1) << ";\n";
+            }
+
+            std::string dpiType(TypeId id) const
+            {
+                if (!id) return "void";
+                const auto &type = model_.types()[id.index - 1];
+                if (type.kind == TypeKind::Array)
+                    throw std::runtime_error("CPU DPI unpacked array ABI is not implemented");
+                if (type.kind == TypeKind::Logic && type.width == 1) return "bool";
+                return cppType(type);
+            }
+
+            std::string dpiDeclaration(const ExternFunction &function) const
+            {
+                if (model_.text(function.declRef) != "core.dpi")
+                    throw std::runtime_error("CPU external function is not a DPI declaration");
+                std::string result = "extern \"C\" " + dpiType(function.returnType) + " " + identifier(model_.text(function.symbol)) + "(";
+                bool first = true;
+                for (const auto &arg : model_.arguments(function))
+                {
+                    if (!first) result += ',';
+                    first = false;
+                    const auto &type = model_.types()[arg.type.index - 1];
+                    const auto base = dpiType(arg.type);
+                    if (arg.direction != DpiDirection::Input) result += base + "*";
+                    else if (type.kind == TypeKind::String) result += "const char*";
+                    else if (type.kind == TypeKind::Logic && type.width > 64) result += "const " + base + "&";
+                    else result += base;
+                }
+                return result + ");";
+            }
+
+            std::string eventGuard(const SimOp &op, std::size_t historyBase) const
+            {
+                const auto *edges = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
+                if (!edges || edges->empty()) return "true";
+                const auto events = model_.operands(op).last(edges->size());
+                const auto refs = model_.objectRefs(op);
+                std::string guard = "false";
+                for (std::size_t i = 0; i < edges->size(); ++i)
+                    guard += " || (" + std::string((*edges)[i] == "posedge" ? "!" : "") +
+                        state({refs[historyBase + i].index, 0}) + " && " +
+                        ((*edges)[i] == "negedge" ? "!" : "") + value(events[i]) + ")";
+                return guard;
+            }
+
+            std::size_t validateCallEvents(const SimOp &op, std::size_t historyBase) const
+            {
+                const auto *edges = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
+                const auto count = edges ? edges->size() : 0;
+                const auto operands = model_.operands(op); const auto refs = model_.objectRefs(op);
+                if (operands.size() < count + 1 || refs.size() != historyBase + count)
+                    throw std::runtime_error("CPU external call condition/event/history arity mismatch");
+                if (type(operands[0]).kind != TypeKind::Logic)
+                    throw std::runtime_error("CPU external call condition must be logic");
+                for (std::size_t i = 0; i < count; ++i)
+                    if (type(operands[operands.size() - count + i]).kind != TypeKind::Logic ||
+                        type(operands[operands.size() - count + i]).width != 1 ||
+                        refs[historyBase + i].kind != ObjectKind::State ||
+                        stateType({refs[historyBase + i].index, 0}).kind != TypeKind::Logic ||
+                        stateType({refs[historyBase + i].index, 0}).width != 1 ||
+                        ((*edges)[i] != "posedge" && (*edges)[i] != "negedge"))
+                        throw std::runtime_error("CPU external call event/history must be one-bit edge state");
+                return count;
+            }
+
+            std::string callCondition(ValueId condition) const
+            {
+                const auto &target = type(condition);
+                return target.width > 64 ? "grhsim_reduce_or_words(" + value(condition) + ',' +
+                    std::to_string(target.width) + ')' : value(condition);
+            }
+
+            void validateDpiCall(const SimOp &op) const
+            {
+                const auto eventCount = validateCallEvents(op, 1);
+                const auto &function = model_.functions()[model_.objectRefs(op)[0].index - 1];
+                std::vector<TypeId> inputs, outputs;
+                if (function.returnType) outputs.push_back(function.returnType);
+                for (const auto &arg : model_.arguments(function))
+                    if (arg.direction == DpiDirection::Input) inputs.push_back(arg.type);
+                    else if (arg.direction == DpiDirection::Output) outputs.push_back(arg.type);
+                for (const auto &arg : model_.arguments(function))
+                    if (arg.direction == DpiDirection::Inout) { inputs.push_back(arg.type); outputs.push_back(arg.type); }
+                const auto operands = model_.operands(op), results = model_.results(op);
+                if (operands.size() != 1 + inputs.size() + eventCount || results.size() != outputs.size())
+                    throw std::runtime_error("CPU DPI call arity disagrees with its signature");
+                const auto checkType = [&](ValueId value, TypeId expected) {
+                    const auto &source = type(value), &target = model_.types()[expected.index - 1];
+                    if (source.kind != target.kind || source.width != target.width || source.domain != target.domain)
+                        throw std::runtime_error("CPU DPI call value type disagrees with its signature");
+                };
+                for (std::size_t i = 0; i < inputs.size(); ++i) checkType(operands[i + 1], inputs[i]);
+                for (std::size_t i = 0; i < outputs.size(); ++i) checkType(results[i], outputs[i]);
+            }
+
+            void sampleEvents(std::ostream &out, const SimOp &op, std::size_t historyBase) const
+            {
+                const auto *edges = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
+                if (!edges) return;
+                const auto events = model_.operands(op).last(edges->size());
+                const auto refs = model_.objectRefs(op);
+                for (std::size_t i = 0; i < edges->size(); ++i)
+                    stage(out, {refs[historyBase + i].index, 0}, value(events[i]));
+            }
+
+            void publishDpiResult(std::ostream &out, ValueId result, const std::string &temporary, PartitionId activeUnit) const
+            {
+                const auto &target = type(result);
+                out << "{\n";
+                auto source = temporary;
+                if (target.kind == TypeKind::Logic && target.width > 64)
+                    out << "grhsim_trunc_words(" << temporary << ',' << target.width << ");\n";
+                else if (target.kind == TypeKind::Logic)
+                {
+                    source = "cpu_dpi_normalized";
+                    out << "auto " << source << '=' << normalize(temporary, target) << ";\n";
+                }
+                out << "if(" << value(result) << "!=" << source << "){\n";
+                out << value(result) << "=std::move(" << source << ");\n";
+                if (const auto *targets = fanout_[result.index]) activate(out, *targets, false, activeUnit);
+                out << "}}\n";
+            }
+
+            void dpiCall(std::ostream &out, const SimOp &op, PartitionId activeUnit) const
+            {
+                const auto &function = model_.functions()[model_.objectRefs(op)[0].index - 1];
+                const auto arguments = model_.arguments(function);
+                const auto operands = model_.operands(op), results = model_.results(op);
+                std::size_t inputCount = 0, outputCount = 0;
+                for (const auto &arg : arguments)
+                {
+                    inputCount += arg.direction == DpiDirection::Input;
+                    outputCount += arg.direction == DpiDirection::Output;
+                }
+                std::size_t input = 1, inoutInput = 1 + inputCount, output = function.returnType ? 1 : 0;
+                std::size_t inoutOutput = output + outputCount;
+                std::vector<std::pair<ValueId, std::string>> produced;
+                out << "if(" << callCondition(operands[0]) << " && (" << eventGuard(op, 1) << ")){\n";
+                std::string call = "::" + identifier(model_.text(function.symbol)) + "(";
+                for (std::size_t i = 0; i < arguments.size(); ++i)
+                {
+                    if (i) call += ',';
+                    const auto &arg = arguments[i]; const auto &target = model_.types()[arg.type.index - 1];
+                    if (arg.direction == DpiDirection::Input)
+                    {
+                        const auto source = value(operands[input++]);
+                        call += target.kind == TypeKind::String ? "(" + source + ").c_str()" : normalize(source, target);
+                    }
+                    else
+                    {
+                        const auto temporary = "cpu_dpi_arg_" + std::to_string(i);
+                        out << dpiType(arg.type) << ' ' << temporary;
+                        if (arg.direction == DpiDirection::Inout) out << '=' << normalize(value(operands[inoutInput++]), target);
+                        else out << "{}";
+                        out << ";\n"; call += '&' + temporary;
+                        produced.push_back({results[arg.direction == DpiDirection::Output ? output++ : inoutOutput++], temporary});
+                    }
+                }
+                call += ')';
+                if (function.returnType)
+                {
+                    out << "auto cpu_dpi_return=" << call << ";\n";
+                    publishDpiResult(out, results[0], "cpu_dpi_return", activeUnit);
+                }
+                else out << call << ";\n";
+                for (const auto &[result, temporary] : produced) publishDpiResult(out, result, temporary, activeUnit);
+                out << "}\n";
+                sampleEvents(out, op, 1);
+            }
+
+            void validateSystemTask(const SimOp &op) const
+            {
+                validateCallEvents(op, 0);
+                if (!model_.results(op).empty()) throw std::runtime_error("CPU system task must not produce values");
+                const auto params = model_.parameters(op);
+                const auto *name = parameter<std::string>(model_, params, "name");
+                static const std::set<std::string_view> supported{
+                    "display", "write", "strobe", "fdisplay", "fwrite", "info", "warning", "error", "fatal", "finish", "stop"};
+                if (!name || !supported.contains(*name))
+                    throw std::runtime_error("CPU system task is not implemented: " + (name ? *name : "<missing>"));
+                const auto *proc = parameter<std::string>(model_, params, "proc_kind");
+                if (proc && *proc == "final")
+                    throw std::runtime_error("CPU final-process task execution is not implemented");
+                const auto *edges = parameter<std::vector<std::string>>(model_, params, "event_edges");
+                for (auto operand : model_.operands(op).subspan(1, model_.operands(op).size() - 1 - (edges ? edges->size() : 0)))
+                    if (type(operand).kind == TypeKind::Array)
+                        throw std::runtime_error("CPU system task array arguments are not implemented");
+            }
+
+            void systemTask(std::ostream &out, const SimOp &op) const
+            {
+                const auto params = model_.parameters(op);
+                const auto &name = *parameter<std::string>(model_, params, "name");
+                const auto *proc = parameter<std::string>(model_, params, "proc_kind");
+                const auto *timed = parameter<bool>(model_, params, "has_timing");
+                const auto *edges = parameter<std::vector<std::string>>(model_, params, "event_edges");
+                const auto operands = model_.operands(op);
+                out << "if(" << callCondition(operands[0]) << " && (" << eventGuard(op, 0) << ")";
+                if (proc && *proc == "initial" && (!timed || !*timed)) out << " && cpu_first_eval";
+                const auto once = onceTasks_.find(op.id.index);
+                if (once != onceTasks_.end()) out << " && !cpu_system_done[" << once->second << ']';
+                out << "){\n";
+                const auto args = operands.subspan(1, operands.size() - 1 - (edges ? edges->size() : 0));
+                out << "const std::array<grhsim_task_arg," << args.size() << "> cpu_args{{";
+                for (std::size_t i = 0; i < args.size(); ++i)
+                {
+                    if (i) out << ',';
+                    out << "grhsim_make_task_arg(" << value(args[i]);
+                    if (type(args[i]).kind == TypeKind::Logic)
+                        out << ',' << type(args[i]).width << ',' << (type(args[i]).isSigned ? "true" : "false");
+                    out << ')';
+                }
+                out << "}};cpu_system_task(\"" << name << "\",cpu_args);\n";
+                if (once != onceTasks_.end()) out << "cpu_system_done[" << once->second << "]=true;\n";
+                out << "}\n";
+                sampleEvents(out, op, 0);
+            }
+
+            void computeGroup(std::ostream &out, std::span<const OpId> ops, PartitionId unit) const
+            {
+                std::map<std::vector<uint32_t>, std::size_t> indices;
+                std::vector<const CpuActivationTargets *> groups;
+                std::map<uint32_t, std::size_t> groupByValue;
+                for (auto id : ops)
+                {
+                    const auto &op = model_.operations()[id.index - 1];
+                    const auto results = model_.results(op);
+                    if (results.size() != 1 || model_.text(op.opType) == "core.dpi.call") continue;
+                    const auto result = results[0];
+                    if (readAliases_[result.index] || !fanout_[result.index] || type(result).kind != TypeKind::Logic) continue;
+                    const auto *targets = fanout_[result.index];
+                    std::vector<uint32_t> key;
+                    for (auto target : targets->activate) key.push_back(target.index);
+                    key.push_back(0);
+                    for (auto target : targets->arm) key.push_back(target.index);
+                    const auto [it, inserted] = indices.emplace(std::move(key), groups.size());
+                    if (inserted) groups.push_back(targets);
+                    groupByValue.emplace(result.index, it->second);
+                }
+                for (std::size_t i = 0; i < groups.size(); ++i) out << "bool cpu_changed_" << i << "=false;\n";
+                for (auto id : ops)
+                {
+                    const auto &op = model_.operations()[id.index - 1];
+                    const auto results = model_.results(op);
+                    const auto found = results.size() == 1 ? groupByValue.find(results[0].index) : groupByValue.end();
+                    compute(out, op, unit, found == groupByValue.end() ? std::string{} : "cpu_changed_" + std::to_string(found->second));
+                }
+                for (std::size_t i = 0; i < groups.size(); ++i)
+                    activate(out, *groups[i], false, unit, "cpu_changed_" + std::to_string(i));
+            }
+
+            void compute(std::ostream &out, const SimOp &op, PartitionId activeUnit, const std::string &changed = {}) const
+            {
+                if (model_.text(op.opType) == "core.system.task")
+                { systemTask(out, op); return; }
+                if (model_.text(op.opType) == "core.dpi.call")
+                { dpiCall(out, op, activeUnit); return; }
+                if (model_.text(op.opType) == "core.output.write")
+                {
+                    const auto operand = model_.operands(op)[0]; const auto ref = model_.objectRefs(op)[0];
+                    out << at(type(operand), "cpu_objects.get()", object(ref).offset) << '=' << value(operand) << ";\n";
+                    return;
+                }
+                const auto result = model_.results(op)[0];
+                const auto &resultType = type(result);
+                if (readAliases_[result.index]) return;
+                if (const auto read = memoryReadIds_[op.id.index])
+                    out << "cpu_read_offsets[" << read - 1 << "]=" << object(model_.objectRefs(op)[0]).offset
+                        << "+static_cast<std::size_t>(" << value(model_.operands(op)[0]) << ")*" << storageBytes(resultType) << ";\n";
+                // Immutable strings are resolved at use sites, inside any existing call guard.
+                // Every compute supernode is initially active; constants need no later fanout.
+                if (resultType.kind == TypeKind::String && staticStrings_.contains(result.index)) return;
+                if (resultType.kind == TypeKind::Logic && resultType.domain == LogicDomain::TwoState && resultType.width > 64)
+                {
+                    const auto name = model_.text(op.opType); const auto operands = model_.operands(op);
+                    const auto words = (resultType.width + 63u) / 64u;
+                    if (name == "core.compute.concat")
+                    {
+                        const auto *targets = fanout_[result.index];
+                        out << "{\n";
+                        if (targets) out << cppType(resultType) << " cpu_concat{};\n";
+                        else out << "auto &cpu_concat=" << value(result) << ";cpu_concat.fill(0);\n";
+                        // Inputs have distinct layout slots. Insert from the least significant end.
+                        uint64_t offset = 0;
+                        for (std::size_t i = operands.size(); i > 0 && offset < resultType.width; --i)
+                        {
+                            const auto operand = operands[i - 1];
+                            const auto width = std::min<uint64_t>(type(operand).width, resultType.width - offset);
+                            out << (type(operand).width > 64 ? "grhsim_insert_words" : "grhsim_insert_scalar_words")
+                                << "(cpu_concat," << offset << ',' << value(operand) << ',' << width << ");\n";
+                            offset += width;
+                        }
+                        if (targets)
+                        {
+                            if (!changed.empty())
+                                out << changed << "|=(" << value(result) << "!=cpu_concat);" << value(result) << "=cpu_concat;\n";
+                            else
+                            {
+                                out << "if(" << value(result) << "!=cpu_concat){" << value(result) << "=cpu_concat;\n";
+                                activate(out, *targets, false, activeUnit); out << "}\n";
+                            }
+                        }
+                        out << "}\n";
+                        return;
+                    }
+                    const auto ptr = [&](ValueId valueId, const std::string &expr) {
+                        return type(valueId).width > 64 ? "(" + expr + ").data()" : "&cpu_operand_" + std::to_string(valueId.index);
+                    };
+                    const bool pointerOperation = name == "core.compute.and" || name == "core.compute.or" ||
+                        name == "core.compute.xor" || name == "core.compute.not" || name == "core.compute.shl" ||
+                        name == "core.compute.lshr" || name == "core.compute.ashr" || name == "core.compute.add" || name == "core.compute.sub";
+                    if (pointerOperation)
+                    {
+                        out << "{\n";
+                        std::set<uint32_t> scalars;
+                        const bool binary = name == "core.compute.and" || name == "core.compute.or" ||
+                            name == "core.compute.xor" || name == "core.compute.add" || name == "core.compute.sub";
+                        for (std::size_t i = 0; i < (binary ? 2u : 1u); ++i)
+                        {
+                            const auto operand = operands[i];
+                            if (type(operand).width <= 64 && scalars.insert(operand.index).second)
+                                out << "const std::uint64_t cpu_operand_" << operand.index << "=grhsim_trunc_u64("
+                                    << value(operand) << ',' << type(operand).width << ");\n";
+                        }
+                    }
+                    if (const auto *targets = fanout_[result.index]; targets &&
+                        (name == "core.compute.and" || name == "core.compute.or" ||
+                         name == "core.compute.xor" || name == "core.compute.not"))
+                    {
+                        const bool unary = name == "core.compute.not";
+                        const char operation = unary ? '~' : name == "core.compute.and" ? '&' : name == "core.compute.or" ? '|' : '^';
+                        out << (changed.empty() ? "if(" : changed + "|=") << "cpu_bitwise_words_changed<'" << operation << "'>(" << ptr(operands[0], value(operands[0])) << ','
+                            << ((type(operands[0]).width + 63u) / 64u) << ',';
+                        if (unary) out << "nullptr,0,";
+                        else out << ptr(operands[1], value(operands[1])) << ',' << ((type(operands[1]).width + 63u) / 64u) << ',';
+                        out << resultType.width << ',' << ptr(result, value(result)) << ',' << words << ')';
+                        if (changed.empty()) { out << "){\n"; activate(out, *targets, false, activeUnit); out << "}\n"; }
+                        else out << ";\n";
+                        out << "}\n";
+                        return;
+                    }
+                    if (name == "core.compute.and" || name == "core.compute.or" || name == "core.compute.xor")
+                    {
+                        out << "grhsim_" << name.substr(std::string_view("core.compute.").size()) << "_words(" << ptr(operands[0], value(operands[0])) << ','
+                            << ((type(operands[0]).width + 63u) / 64u) << ',' << ptr(operands[1], value(operands[1])) << ','
+                            << ((type(operands[1]).width + 63u) / 64u) << ',' << resultType.width << ',' << ptr(result, value(result)) << ',' << words << ");\n";
+                        out << "}\n";
+                        return;
+                    }
+                    if (name == "core.compute.not")
+                    {
+                        out << "grhsim_not_words(" << ptr(operands[0], value(operands[0])) << ',' << ((type(operands[0]).width + 63u) / 64u) << ','
+                            << resultType.width << ',' << ptr(result, value(result)) << ',' << words << ");\n";
+                        out << "}\n";
+                        return;
+                    }
+                    if (name == "core.compute.shl" || name == "core.compute.lshr" || name == "core.compute.ashr")
+                    {
+                        const auto *targets = fanout_[result.index];
+                        if (targets)
+                            out << (changed.empty() ? "if(" : changed + "|=") << "cpu_shift_words_changed<'" << (name == "core.compute.shl" ? 'L' : name == "core.compute.lshr" ? 'R' : 'A') << "'>(";
+                        else out << "grhsim_" << name.substr(std::string_view("core.compute.").size()) << "_words(";
+                        out << ptr(operands[0], value(operands[0])) << ','
+                            << ((type(operands[0]).width + 63u) / 64u) << ",grhsim_index_words(" << value(operands[1]) << ',' << resultType.width << ")," << resultType.width << ','
+                            << ptr(result, value(result)) << ',' << words << ')';
+                        if (targets && changed.empty()) { out << "){\n"; activate(out, *targets, false, activeUnit); out << "}\n"; }
+                        else out << ";\n";
+                        out << "}\n";
+                        return;
+                    }
+                    if (name == "core.compute.add" || name == "core.compute.sub")
+                    {
+                        const auto *targets = fanout_[result.index];
+                        if (targets) out << (changed.empty() ? "if(" : changed + "|=") << "cpu_arithmetic_words_changed<'" << (name == "core.compute.add" ? '+' : '-') << "'>(";
+                        else out << "grhsim_" << name.substr(std::string_view("core.compute.").size()) << "_words(";
+                        out << ptr(operands[0], value(operands[0])) << ','
+                            << ((type(operands[0]).width + 63u) / 64u) << ',' << ptr(operands[1], value(operands[1])) << ','
+                            << ((type(operands[1]).width + 63u) / 64u) << ',' << resultType.width << ',' << ptr(result, value(result)) << ',' << words << ')';
+                        if (targets && changed.empty()) { out << "){\n"; activate(out, *targets, false, activeUnit); out << "}\n"; }
+                        else out << ";\n";
+                        out << "}\n";
+                        return;
+                    }
+                }
+                const auto expr = normalize(expression(op), resultType);
+                if (!changed.empty())
+                    out << "{const auto cpu_value=" << expr << ';' << changed << "|=(" << value(result) << "!=cpu_value);"
+                        << value(result) << "=cpu_value;}\n";
+                else if (const auto *targets = fanout_[result.index])
+                {
+                    out << "{ const auto cpu_value=" << expr << "; if(" << value(result) << "!=cpu_value){\n"
+                        << value(result) << "=cpu_value;\n";
+                    activate(out, *targets, false, activeUnit); out << "}}\n";
+                }
+                else out << value(result) << '=' << expr << ";\n";
+            }
+
+            void stage(std::ostream &out, StateId target, std::string expression) const
+            {
+                if (batchedHistories_[target.index]) return;
+                const auto range = stateRanges_[target.index]; const auto &type = stateType(target);
+                out << "cpu_stage<" << cppType(type) << ">(" << target.index << ',' << object(ObjectRef::state(target)).offset
+                    << ',' << range.offset << ',' << range.count << ',' << (projected_[target.index] ? "true" : "false")
+                    << ")=" << normalize(std::move(expression), type) << ";\n";
+            }
+
+            std::string stageCell(StateId target, const std::string &row) const
+            {
+                const auto &array = stateType(target);
+                const auto &element = model_.types()[array.elementType.index - 1];
+                const auto range = memoryRanges_[target.index];
+                return "cpu_stage_cell(" + std::to_string(memoryDirtyBases_[target.index]) + "," +
+                    std::to_string(object(ObjectRef::state(target)).offset) + "," + std::to_string(storageBytes(element)) +
+                    "," + row + "," + std::to_string(range.offset) + "," + std::to_string(range.count) + "," +
+                    (projected_[target.index] ? "true" : "false") + ")";
+            }
+
+            void commit(std::ostream &out, const SimOp &op) const
+            {
+                const auto operands = model_.operands(op); const auto refs = model_.objectRefs(op);
+                const auto opName = model_.text(op.opType);
+                if (opName == "core.state.memFill")
+                {
+                    if (refs.empty() || operands.size() < 2) throw std::runtime_error("CPU memory fill has invalid arity");
+                    const auto target = StateId{refs[0].index, 0}; const auto &array = stateType(target);
+                    if (array.kind != TypeKind::Array) throw std::runtime_error("CPU memory fill target is not an array");
+                    const auto &element = model_.types()[array.elementType.index - 1];
+                    const auto *edges = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
+                    const std::size_t eventCount = edges ? edges->size() : 0;
+                    if (operands.size() <= eventCount) throw std::runtime_error("CPU memory fill has no data operand");
+                    std::string guard = "false";
+                    if (edges) for (std::size_t i = 0; i < eventCount; ++i)
+                    {
+                        const auto event = value(operands[operands.size() - eventCount + i]);
+                        const StateId history{refs[i + 1].index, 0};
+                        guard += " || (" + std::string((*edges)[i] == "posedge" ? "!" : "") + state(history) + " && " +
+                                 ((*edges)[i] == "negedge" ? "!" : "") + event + ")";
+                    }
+                    out << "if((" << guard << ") && " << value(operands[0]) << "){ for(std::size_t i=0;i<" << array.count << ";++i) "
+                        << "cpu_at<" << cppType(element) << ">(" << stageCell(target, "i") << ",0)="
+                        << normalize(value(operands[1]), element) << "; }\n";
+                    if (edges) for (std::size_t i = 0; i < eventCount; ++i)
+                        stage(out, {refs[i + 1].index, 0}, value(operands[operands.size() - eventCount + i]));
+                    return;
+                }
+                if (opName == "core.state.memAssign")
+                    throw std::runtime_error("CPU C++ emit memAssign array values are not implemented");
+                if (opName == "core.state.memWrite")
+                {
+                    if (refs.empty() || operands.size() < 4) throw std::runtime_error("CPU memory write has invalid arity");
+                    const auto target = StateId{refs[0].index, 0}; const auto &array = stateType(target);
+                    if (array.kind != TypeKind::Array) throw std::runtime_error("CPU memory write target is not an array");
+                    const auto &element = model_.types()[array.elementType.index - 1];
+                    std::string guard = "false";
+                    const auto *edges = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
+                    if (edges) for (std::size_t i = 0; i < edges->size(); ++i)
+                    {
+                        const auto event = value(operands[operands.size() - edges->size() + i]);
+                        const StateId history{refs[i + 1].index, 0};
+                        guard += " || (" + std::string((*edges)[i] == "posedge" ? "!" : "") + state(history) + " && " +
+                                 ((*edges)[i] == "negedge" ? "!" : "") + event + ")";
+                    }
+                    out << "if((" << guard << ") && " << value(operands[0]) << " && static_cast<std::size_t>("
+                        << value(operands[1]) << ")<" << array.count << "){\n";
+                    out << "auto &cpu_cell=cpu_at<" << cppType(element) << ">(" << stageCell(target, value(operands[1])) << ",0);\n";
+                    if (element.kind == TypeKind::Logic && element.width > 64)
+                        out << "grhsim_apply_masked_words_inplace(cpu_cell," << value(operands[2]) << ','
+                            << value(operands[3]) << ',' << element.width << ");}\n";
+                    else
+                        out << "cpu_cell=" << normalize("(static_cast<std::uint64_t>(cpu_cell)&~static_cast<std::uint64_t>(" + value(operands[3]) +
+                            "))|(static_cast<std::uint64_t>(" + value(operands[2]) + ")&static_cast<std::uint64_t>(" + value(operands[3]) + "))", element) << ";}\n";
+                    if (edges) for (std::size_t i = 0; i < edges->size(); ++i)
+                        stage(out, {refs[i + 1].index, 0}, value(operands[operands.size() - edges->size() + i]));
+                    return;
+                }
+                if (opName == "core.state.memWriteSeq")
+                {
+                    if (refs.empty() || operands.size() < 3) throw std::runtime_error("CPU sequential memory write has invalid arity");
+                    const auto target = StateId{refs[0].index, 0}; const auto &array = stateType(target);
+                    if (array.kind != TypeKind::Array) throw std::runtime_error("CPU sequential memory write target is not an array");
+                    const auto &element = model_.types()[array.elementType.index - 1];
+                    const auto *edges = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
+                    const std::size_t eventCount = edges ? edges->size() : 0;
+                    if (operands.size() < eventCount || (operands.size() - eventCount) % 3 != 0)
+                        throw std::runtime_error("CPU sequential memory write operands are not triples");
+                    std::string guard = "false";
+                    if (edges) for (std::size_t i = 0; i < eventCount; ++i)
+                    {
+                        const auto event = value(operands[operands.size() - eventCount + i]);
+                        const StateId history{refs[i + 1].index, 0};
+                        guard += " || (" + std::string((*edges)[i] == "posedge" ? "!" : "") + state(history) + " && " +
+                                 ((*edges)[i] == "negedge" ? "!" : "") + event + ")";
+                    }
+                    out << "if(" << guard << "){\n";
+                    for (std::size_t i = 0; i < operands.size() - eventCount; i += 3)
+                        out << "if(" << value(operands[i]) << " && static_cast<std::size_t>(" << value(operands[i + 1]) << ")<"
+                            << array.count << "){ cpu_at<" << cppType(element) << ">(" << stageCell(target, value(operands[i + 1]))
+                            << ",0)=" << normalize(value(operands[i + 2]), element) << "; }\n";
+                    out << "}\n";
+                    if (edges) for (std::size_t i = 0; i < edges->size(); ++i)
+                        stage(out, {refs[i + 1].index, 0}, value(operands[operands.size() - edges->size() + i]));
+                    return;
+                }
+                const auto *edges = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
+                std::string guard = model_.text(op.opType) == "core.state.latchWrite" ? "true" : "false";
+                if (edges)
+                    for (std::size_t i = 0; i < edges->size(); ++i)
+                    {
+                        const auto event = value(operands[operands.size() - edges->size() + i]);
+                        const StateId history{refs[i + 1].index, 0};
+                        guard += " || (" + std::string((*edges)[i] == "posedge" ? "!" : "") + state(history) + " && " +
+                                 ((*edges)[i] == "negedge" ? "!" : "") + event + ")";
+                    }
+                out << "if((" << guard << ") && " << value(operands[0]) << "){\n";
+                const StateId target{refs[0].index, 0}; const auto range = stateRanges_[target.index];
+                if (directCommitStates_[target.index])
+                {
+                    // No commit observer can see this single writer before the next compute phase.
+                    out << "// cpu_direct_commit state=" << target.index << "\n"
+                        << "auto &cpu_current=" << state(target) << ";\nconst auto cpu_value="
+                        << normalize("(static_cast<std::uint64_t>(cpu_current)&~static_cast<std::uint64_t>(" + value(operands[2]) +
+                            "))|(static_cast<std::uint64_t>(" + value(operands[1]) + ")&static_cast<std::uint64_t>(" + value(operands[2]) + "))",
+                            stateType(target)) << ";\nif(cpu_current!=cpu_value){cpu_current=cpu_value;\n";
+                    if (projected_[target.index] || range.count)
+                        out << "cpu_direct_state_changed(" << range.offset << ',' << range.count << ','
+                            << (projected_[target.index] ? "true" : "false") << ");\n";
+                    out << "}}\n";
+                }
+                else
+                {
+                    out << "auto &cpu_next=cpu_stage<" << cppType(stateType(target)) << ">(" << target.index << ','
+                        << object(refs[0]).offset << ',' << range.offset << ',' << range.count << ','
+                        << (projected_[target.index] ? "true" : "false") << ");\n";
+                    if (stateType(target).kind == TypeKind::Logic && stateType(target).width > 64)
+                        out << "grhsim_apply_masked_words_inplace(cpu_next," << value(operands[1]) << ','
+                            << value(operands[2]) << ',' << stateType(target).width << ");}\n";
+                    else
+                        out << "cpu_next=" << normalize("(static_cast<std::uint64_t>(cpu_next)&~static_cast<std::uint64_t>(" + value(operands[2]) +
+                            "))|(static_cast<std::uint64_t>(" + value(operands[1]) + ")&static_cast<std::uint64_t>(" + value(operands[2]) + "))", stateType(target)) << ";}\n";
+                }
+                if (edges)
+                    for (std::size_t i = 0; i < edges->size(); ++i)
+                        stage(out, {refs[i + 1].index, 0}, value(operands[operands.size() - edges->size() + i]));
+            }
+
+            void header(std::ostream &out) const
+            {
+                out << "#pragma once\n#include \"" << prefix_ << "_runtime.hpp\"\n#include <memory>\n#include <stdexcept>\n";
+                out << "template<class T> inline T &cpu_at(std::byte *data, std::size_t offset){return *reinterpret_cast<T*>(data+offset);}\n";
+                // Tracked outputs are persistent initialized slots; local writes use the legacy helpers.
+                out << R"CPP(template<char Operation>
+inline bool cpu_bitwise_words_changed(const std::uint64_t *lhs, std::size_t lhsWords,
+    const std::uint64_t *rhs, std::size_t rhsWords, std::size_t width,
+    std::uint64_t *out, std::size_t outWords)
+{
+    static_assert(Operation=='&' || Operation=='|' || Operation=='^' || Operation=='~');
+    bool changed=false;
+    for(std::size_t i=0;i<outWords;++i){
+        const std::uint64_t a=i<lhsWords?lhs[i]:UINT64_C(0);
+        std::uint64_t word;
+        if constexpr(Operation=='~') word=~a;
+        else {
+            const std::uint64_t b=i<rhsWords?rhs[i]:UINT64_C(0);
+            if constexpr(Operation=='&') word=a&b;
+            else if constexpr(Operation=='|') word=a|b;
+            else word=a^b;
+        }
+        if(i>=width/64) word=i==width/64 ? word&grhsim_mask(width%64) : UINT64_C(0);
+        changed|=out[i]!=word;
+        out[i]=word;
+    }
+    return changed;
+}
+template<char Operation>
+inline bool cpu_arithmetic_words_changed(const std::uint64_t *lhs, std::size_t lhsWords,
+    const std::uint64_t *rhs, std::size_t rhsWords, std::size_t width,
+    std::uint64_t *out, std::size_t outWords)
+{
+    static_assert(Operation=='+' || Operation=='-');
+    bool changed=false;
+    std::uint64_t carry=0;
+    for(std::size_t i=0;i<outWords;++i){
+        const std::uint64_t a=i<lhsWords?lhs[i]:UINT64_C(0);
+        const std::uint64_t b=i<rhsWords?rhs[i]:UINT64_C(0);
+        std::uint64_t word;
+        if constexpr(Operation=='+'){
+            const unsigned __int128 sum=static_cast<unsigned __int128>(a)+b+carry;
+            word=static_cast<std::uint64_t>(sum);carry=sum>>64;
+        }else{
+            const std::uint64_t subtrahend=b+carry;
+            carry=(subtrahend<b || a<subtrahend)?1:0;
+            word=a-subtrahend;
+        }
+        if(i>=width/64) word=i==width/64 ? word&grhsim_mask(width%64) : UINT64_C(0);
+        changed|=out[i]!=word;
+        out[i]=word;
+    }
+    return changed;
+}
+template<char Operation>
+inline bool cpu_shift_words_changed(const std::uint64_t *value, std::size_t valueWords,
+    std::size_t amount, std::size_t width, std::uint64_t *out, std::size_t outWords)
+{
+    static_assert(Operation=='L' || Operation=='R' || Operation=='A');
+    bool changed=false;
+    const bool sign=Operation=='A' && grhsim_sign_bit_words(value,valueWords,width);
+    const std::size_t wordShift=amount/64,bitShift=amount%64;
+    for(std::size_t step=0;step<outWords;++step){
+        const std::size_t i=Operation=='L'?outWords-1-step:step;
+        std::uint64_t word=0;
+        if(amount<width){
+            if constexpr(Operation=='L'){
+                if(i>=wordShift){
+                    const std::size_t src=i-wordShift;
+                    if(src<valueWords) word=value[src]<<bitShift;
+                    if(bitShift && src>0 && src-1<valueWords) word|=value[src-1]>>(64-bitShift);
+                }
+            }else{
+                const std::size_t src=i+wordShift;
+                if(src<valueWords) word=value[src]>>bitShift;
+                if(bitShift && src+1<valueWords) word|=value[src+1]<<(64-bitShift);
+            }
+        }
+        if(sign){
+            const std::size_t start=amount>=width?0:width-amount;
+            if(i>=start/64) word|=i==start/64 ? ~grhsim_mask(start%64) : ~UINT64_C(0);
+        }
+        if(i>=width/64) word=i==width/64 ? word&grhsim_mask(width%64) : UINT64_C(0);
+        changed|=out[i]!=word;
+        out[i]=word;
+    }
+    return changed;
+}
+)CPP";
+                out << "static_assert(sizeof(std::string*)==" << layout_.pointerBytes << ");\n"
+                    << "template<> inline std::string &cpu_at<std::string>(std::byte *data,std::size_t offset){return *cpu_at<std::string*>(data,offset);}\n";
+                out << "template<std::size_t N,std::size_t R> inline std::array<std::uint64_t,N> grhsim_concat_wide_scalar(const std::array<std::uint64_t,R>& lhs,std::size_t lhsWidth,std::uint64_t rhs,std::size_t rhsWidth,std::size_t totalWidth){std::array<std::uint64_t,N> out{};grhsim_insert_scalar_words(out,0,rhs,rhsWidth);grhsim_insert_words(out,rhsWidth,lhs,std::min(lhsWidth,totalWidth-rhsWidth));grhsim_trunc_words(out,totalWidth);return out;}\n";
+                out << "template<std::size_t N> inline std::array<std::uint64_t,N> grhsim_concat_wide_scalar(std::uint64_t lhs,std::size_t lhsWidth,std::uint64_t rhs,std::size_t rhsWidth,std::size_t totalWidth){std::array<std::uint64_t,N> out{};grhsim_insert_scalar_words(out,0,rhs,rhsWidth);grhsim_insert_scalar_words(out,rhsWidth,lhs,std::min(lhsWidth,totalWidth-rhsWidth));grhsim_trunc_words(out,totalWidth);return out;}\n";
+                out << "template<std::size_t N> inline std::array<std::uint64_t,N> grhsim_concat_scalar_scalar_wide(std::uint64_t lhs,std::size_t lhsWidth,std::uint64_t rhs,std::size_t rhsWidth,std::size_t totalWidth){std::array<std::uint64_t,N> out{};grhsim_insert_scalar_words(out,0,rhs,rhsWidth);grhsim_insert_scalar_words(out,rhsWidth,lhs,std::min(lhsWidth,totalWidth-rhsWidth));grhsim_trunc_words(out,totalWidth);return out;}\n";
+                out << "template<std::size_t N,std::size_t R> inline std::array<std::uint64_t,N> grhsim_concat_scalar_wide(std::uint64_t lhs,std::size_t lhsWidth,const std::array<std::uint64_t,R>& rhs,std::size_t rhsWidth,std::size_t totalWidth){std::array<std::uint64_t,N> out{};grhsim_insert_words(out,0,rhs,std::min(rhsWidth,totalWidth));if(rhsWidth<totalWidth)grhsim_insert_scalar_words(out,rhsWidth,lhs,std::min(lhsWidth,totalWidth-rhsWidth));grhsim_trunc_words(out,totalWidth);return out;}\n";
+                out << "class " << class_ << " {\npublic:\n";
+                for (const auto &input : model_.inputs()) out << cppType(model_.types()[input.type.index - 1]) << ' ' << identifier(model_.text(input.name)) << "{};\n";
+                for (const auto &output : model_.outputs()) out << cppType(model_.types()[output.type.index - 1]) << ' ' << identifier(model_.text(output.name)) << "{};\n";
+                out << class_ << "(){cpu_bind_strings();}\n"
+                    << "void init();\nvoid eval();\nvoid set_runtime_profile_enabled(bool enabled){if(enabled) throw std::runtime_error(\"CPU runtime profiling is not implemented\");}\nvoid dump_runtime_profile() const {}\nprivate:\n";
+                if (hasSystemTasks_)
+                    out << "bool cpu_first_eval=true;std::array<bool," << onceTasks_.size() << "> cpu_system_done{};\n"
+                        << "std::vector<std::string> cpu_strobes;\nvoid cpu_system_task(std::string_view,std::span<const grhsim_task_arg>);\n";
+                out << "std::unique_ptr<std::byte[]> cpu_objects{new std::byte[" << std::max<uint64_t>(layout_.objectBytes, 1) << "]{}};\n"
+                    << "std::unique_ptr<std::byte[]> cpu_shadow{new std::byte[" << std::max<uint64_t>(layout_.objectBytes, 1) << "]{}};\n"
+                    << "std::unique_ptr<std::byte[]> cpu_boundary{new std::byte[" << std::max<uint64_t>(layout_.boundaryBytes, 1) << "]{}};\n"
+                    << "alignas(8) std::array<std::byte," << schedule_.inputShadowBytes << "> cpu_inputs{};\n"
+                    << "std::unique_ptr<std::string[]> cpu_strings{new std::string[" << persistentStrings_.size() << "]};\n"
+                    << "void cpu_bind_strings();\n"
+                    << "std::uint64_t cpu_rng=UINT64_C(0x6a09e667f3bcc909);\n"
+                    << "std::array<std::uint8_t," << layout_.runtimeBytes << "> cpu_flags{},cpu_next_arms{};\n"
+                    << "std::vector<std::uint8_t> cpu_dirty=std::vector<std::uint8_t>(" << dirtyBytes_ << ");\n"
+                    << "struct Pending{std::size_t state,offset,size; std::uint32_t begin,count; bool projection;bool memory=false;};\n"
+                    << "struct Target{std::uint32_t offset; std::uint8_t mask; bool arm;};\n"
+                    << "static const std::array<Target," << stateTargets_.size() << "> cpu_targets;\nstd::vector<Pending> cpu_pending;\n"
+                    << "static const std::array<Target," << memoryReaders_.size() << "> cpu_memory_readers;\n"
+                    << "std::array<std::size_t," << memoryReaders_.size() << "> cpu_read_offsets{};\n"
+                    << "bool cpu_direct_again=false;\nvoid cpu_direct_state_changed(std::uint32_t begin,std::uint32_t count,bool projection);\n"
+                    << "std::byte *cpu_stage_cell(std::size_t key,std::size_t offset,std::size_t size,std::size_t row,std::uint32_t begin,std::uint32_t count,bool projection){\n"
+                    << "key+=row;offset+=row*size;if(!cpu_dirty[key]){cpu_dirty[key]=1;std::memcpy(cpu_shadow.get()+offset,cpu_objects.get()+offset,size);cpu_pending.push_back({key,offset,size,begin,count,projection,true});}return cpu_shadow.get()+offset;}\n"
+                    << "template<class T> T &cpu_stage(std::uint32_t state,std::size_t offset,std::uint32_t begin,std::uint32_t count,bool projection){\n"
+                    << "if(!cpu_dirty[state]){cpu_dirty[state]=1;std::memcpy(cpu_shadow.get()+offset,cpu_objects.get()+offset,sizeof(T));cpu_pending.push_back({state,offset,sizeof(T),begin,count,projection});}\n"
+                    << "return cpu_at<T>(cpu_shadow.get(),offset);}\n"
+                    << "std::byte *cpu_stage_bytes(std::uint32_t state,std::size_t offset,std::size_t size,std::uint32_t begin,std::uint32_t count,bool projection){\n"
+                    << "if(!cpu_dirty[state]){cpu_dirty[state]=1;std::memcpy(cpu_shadow.get()+offset,cpu_objects.get()+offset,size);cpu_pending.push_back({state,offset,size,begin,count,projection});}\n"
+                    << "return cpu_shadow.get()+offset;}\nbool cpu_publish();\n";
+                for (std::size_t i = 0; i < initChunkCount(); ++i) out << "void cpu_init_" << i << "();\n";
+                for (const auto &task : schedule_.numaNodes[0].cores[0].tasks) out << "void cpu_task_" << task.id.index << "();\n";
+                for (const auto &partition : mapping_.partitionTree.partitions)
+                    for (std::size_t i = 0; i < partition.attrs.helperChunks.size(); ++i)
+                        out << "void cpu_helper_" << partition.id.index << '_' << i << "(std::byte *cpu_local,std::uint8_t &cpu_active_word);\n";
+                out << "};\n";
+            }
+
+            void initBody(std::ostream &out, std::size_t chunk, std::size_t begin) const
+            {
+                out << "#include \"" << prefix_ << ".hpp\"\nvoid " << class_ << "::cpu_init_" << chunk << "(){\n";
+                constexpr std::size_t chunkSteps = 4096;
+                std::size_t index = 0;
+                for (const auto &record : model_.initRecords())
+                    for (const auto &step : model_.steps(record))
+                    {
+                        if (index >= begin + chunkSteps) { out << "}\n"; return; }
+                        if (index >= begin)
+                        {
+                            initStep(out, record.state, step);
+                        }
+                        ++index;
+                    }
+                out << "}\n";
+            }
+
+            std::size_t initChunkCount() const
+            {
+                constexpr std::size_t chunkSteps = 4096;
+                std::size_t steps = 0;
+                for (const auto &record : model_.initRecords()) steps += model_.steps(record).size();
+                return (steps + chunkSteps - 1) / chunkSteps;
+            }
+
+            void driver(std::ostream &out) const
+            {
+                out << "#include \"" << prefix_ << ".hpp\"\nconst std::array<" << class_ << "::Target," << stateTargets_.size() << "> " << class_ << "::cpu_targets{{\n";
+                for (auto target : stateTargets_) out << '{' << target.offset << ',' << target.mask << ',' << (target.arm ? "true" : "false") << "},\n";
+                out << "}};\nconst std::array<" << class_ << "::Target," << memoryReaders_.size() << "> " << class_ << "::cpu_memory_readers{{\n";
+                for (auto target : memoryReaders_) out << '{' << target.offset << ',' << target.mask << ",false},\n";
+                out << "}};\nvoid " << class_ << "::cpu_bind_strings(){\n";
+                for (std::size_t i = 0; i < persistentStrings_.size(); ++i)
+                    out << "cpu_at<std::string*>(" << persistentStrings_[i].first << ',' << persistentStrings_[i].second
+                        << ")=&cpu_strings[" << i << "];\n";
+                out << "}\nvoid " << class_ << "::init(){\nstd::memset(cpu_objects.get(),0," << layout_.objectBytes << ");\nstd::memset(cpu_boundary.get(),0," << layout_.boundaryBytes << ");\n"
+                    << "cpu_inputs.fill(std::byte{});cpu_flags.fill(0);cpu_next_arms.fill(0);std::fill(cpu_dirty.begin(),cpu_dirty.end(),0);cpu_pending.clear();cpu_direct_again=false;cpu_read_offsets.fill(0);\n";
+                out << "for(std::size_t i=0;i<" << persistentStrings_.size() << ";++i)cpu_strings[i].clear();\ncpu_bind_strings();\n";
+                out << "cpu_rng=UINT64_C(0x6a09e667f3bcc909);\n";
+                if (hasSystemTasks_) out << "cpu_first_eval=true;cpu_system_done.fill(false);cpu_strobes.clear();\n";
+                for (std::size_t i = 0; i < initChunkCount(); ++i) out << "cpu_init_" << i << "();\n";
+                for (const auto &slot : layout_.runtime)
+                    if (slot.kind != CpuRuntimeKind::EventEdge) out << "cpu_flags[" << slot.offset << "]=" << (slot.kind == CpuRuntimeKind::ActiveWord ? 255 : 1) << ";\n";
+                out << "}\nvoid " << class_ << "::cpu_direct_state_changed(std::uint32_t begin,std::uint32_t count,bool projection){\n"
+                    << "cpu_direct_again=cpu_direct_again||projection;\n"
+                    << "for(std::uint32_t i=begin;i<begin+count;++i){const auto &t=cpu_targets[i];if(t.arm)cpu_next_arms[t.offset]=1;else cpu_flags[t.offset]|=t.mask;}}\n";
+                out << "bool " << class_ << "::cpu_publish(){bool again=cpu_direct_again;cpu_direct_again=false;for(const auto &p:cpu_pending){\n"
+                    << "if(std::memcmp(cpu_objects.get()+p.offset,cpu_shadow.get()+p.offset,p.size)!=0){std::memcpy(cpu_objects.get()+p.offset,cpu_shadow.get()+p.offset,p.size);\n"
+                    << "again=again||p.projection;for(std::uint32_t i=p.begin;i<p.begin+p.count;++i){if(p.memory){if(cpu_read_offsets[i]==p.offset){const auto &t=cpu_memory_readers[i];cpu_flags[t.offset]|=t.mask;}}else{const auto &t=cpu_targets[i];if(t.arm)cpu_next_arms[t.offset]=1;else cpu_flags[t.offset]|=t.mask;}}}cpu_dirty[p.state]=0;}cpu_pending.clear();return again;}\n";
+                out << "void " << class_ << "::eval(){\n";
+                for (const auto &input : model_.inputs()) out << at(model_.types()[input.type.index - 1], "cpu_objects.get()", object(ObjectRef::input(input.id)).offset)
+                    << '=' << normalize("this->" + identifier(model_.text(input.name)), model_.types()[input.type.index - 1]) << ";\n";
+                std::vector<InputId> inputByValue(model_.values().size() + 1);
+                for (const auto &op : model_.operations()) if (model_.text(op.opType) == "core.input.read")
+                    inputByValue[model_.results(op)[0].index] = {model_.objectRefs(op)[0].index, 0};
+                for (std::size_t i = 0; i < schedule_.inputFanout.size(); ++i)
+                {
+                    const auto &row = schedule_.inputFanout[i]; const auto &shadow = schedule_.inputShadows[i];
+                    const auto current = at(type(row.source), "cpu_objects.get()", object(ObjectRef::input(inputByValue[row.source.index])).offset);
+                    const auto previous = at(type(row.source), "cpu_inputs.data()", shadow.offset);
+                    out << "if(" << previous << "!=" << current << "){" << previous << '=' << current << ";\n";
+                    activate(out, row.targets, false); out << "}\n";
+                }
+                out << "for(std::uint32_t cpu_round=0;cpu_round<100000;++cpu_round){\n";
+                CpuActivationTargets seeds{schedule_.roundSeeds, {}}; activate(out, seeds, false);
+                for (const auto &task : schedule_.numaNodes[0].cores[0].tasks)
+                {
+                    if (task.execution == CpuExecution::DomainGatedCommit)
+                        out << "if(cpu_flags[" << armOffsets_[mapping_.partitionTree.partitions[task.partition.index - 1].parent.index] << "])";
+                    out << "cpu_task_" << task.id.index << "();\n";
+                }
+                out << "const bool cpu_again=cpu_publish();\n";
+                for (const auto &slot : layout_.runtime) if (slot.kind == CpuRuntimeKind::DomainArm)
+                    out << "cpu_flags[" << slot.offset << "]=cpu_next_arms[" << slot.offset << "];cpu_next_arms[" << slot.offset << "]=0;\n";
+                out << "if(!cpu_again){\n";
+                if (hasSystemTasks_)
+                    out << "cpu_first_eval=false;for(const auto &text:cpu_strobes)std::cout<<text<<'\\n';cpu_strobes.clear();\n";
+                for (const auto &output : model_.outputs()) out << "this->" << identifier(model_.text(output.name)) << '=' <<
+                    at(model_.types()[output.type.index - 1], "cpu_objects.get()", object(ObjectRef::output(output.id)).offset) << ";\n";
+                out << "return;}}throw std::runtime_error(\"CPU model did not converge\");}\n";
+                if (hasSystemTasks_) systemTaskDriver(out);
+            }
+
+            void systemTaskDriver(std::ostream &out) const
+            {
+                out << "void " << class_ << "::cpu_system_task(std::string_view name,std::span<const grhsim_task_arg> args){\n";
+                out << R"CPP(
+std::ostream *stream=(name=="warning"||name=="error"||name=="fatal")?&std::cerr:&std::cout;
+if(name=="fwrite"||name=="fdisplay"){
+    if(args.empty())throw std::runtime_error("CPU file task is missing its handle");
+    const auto handle=grhsim_task_arg_u64(args.front());args=args.subspan(1);
+    if(handle==1||handle==UINT64_C(0x80000001))stream=&std::cout;
+    else if(handle==2||handle==UINT64_C(0x80000002))stream=&std::cerr;
+    else throw std::runtime_error("CPU system task file handle is not implemented");
+}
+const bool terminal=name=="fatal"||name=="finish"||name=="stop";
+int exitCode=name=="fatal"?1:0;
+if(terminal&&!args.empty()&&args.front().kind==grhsim_task_arg_kind::Logic){
+    exitCode=static_cast<int>(grhsim_task_arg_u64(args.front()));args=args.subspan(1);
+}
+auto text=grhsim_format_task_message(args);
+if(name=="strobe"){cpu_strobes.push_back(std::move(text));return;}
+if(name=="info"||name=="warning"||name=="error"||name=="fatal")text="["+std::string(name)+"] "+text;
+if(!terminal||!text.empty()){
+    *stream<<text;
+    if(name!="write"&&name!="fwrite")*stream<<'\n';
+}
+if(terminal){
+    for(const auto &pending:cpu_strobes)std::cout<<pending<<'\n';
+    cpu_strobes.clear();std::cout.flush();std::cerr.flush();std::exit(exitCode);
+}
+}
+)CPP";
+            }
+
+            std::string stableCommitHistories(const CpuScheduledTask &task) const
+            {
+                if (task.execution != CpuExecution::DomainGatedCommit) return {};
+                struct Group { ValueId value; std::vector<uint64_t> offsets; };
+                std::vector<Group> groups;
+                std::size_t count = 0;
+                const auto &tree = mapping_.partitionTree;
+                for (auto unit : tree.partitions[task.partition.index - 1].children)
+                    for (auto id : tree.partitions[unit.index - 1].ops)
+                    {
+                        const auto &op = model_.operations()[id.index - 1];
+                        const auto name = model_.text(op.opType);
+                        if (name != "core.state.regWrite" && name != "core.state.memWrite" &&
+                            name != "core.state.memFill" && name != "core.state.memWriteSeq") return {};
+                        const auto *edges = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
+                        if (!edges || edges->empty()) return {};
+                        const auto events = model_.operands(op).last(edges->size());
+                        const auto histories = model_.objectRefs(op).last(edges->size());
+                        for (std::size_t i = 0; i < edges->size(); ++i)
+                        {
+                            if (((*edges)[i] != "posedge" && (*edges)[i] != "negedge") ||
+                                !privateByteHistories_[histories[i].index]) return {};
+                            auto group = std::find_if(groups.begin(), groups.end(), [&](const auto &g) { return g.value == events[i]; });
+                            if (group == groups.end())
+                            {
+                                if (groups.size() == 8) return {};
+                                groups.push_back({events[i], {}}); group = groups.end() - 1;
+                            }
+                            group->offsets.push_back(object(histories[i]).offset); ++count;
+                        }
+                    }
+                if (count < 16) return {};
+                std::ostringstream out;
+                out << "/* cpu_stable_history_scan histories=" << count << " groups=" << groups.size() << " */ ([&](){";
+                for (auto &group : groups)
+                {
+                    auto &offsets = group.offsets;
+                    std::sort(offsets.begin(), offsets.end());
+                    // Every byte is a distinct private history; no task can have staged it earlier.
+                    if (offsets.back() - offsets.front() + 1 == offsets.size())
+                        out << "if(std::memchr(cpu_objects.get()+" << offsets.front() << ",!bool(" << value(group.value) << "),"
+                            << offsets.size() << "))return false;";
+                    else
+                    {
+                        out << "{const auto cpu_current=std::byte{static_cast<unsigned char>(bool(" << value(group.value)
+                            << "))};static constexpr std::size_t cpu_histories[]={";
+                        for (std::size_t i = 0; i < offsets.size(); ++i) out << (i ? "," : "") << offsets[i];
+                        out << "};for(auto cpu_offset:cpu_histories)if(cpu_objects[cpu_offset]!=cpu_current)return false;}";
+                    }
+                }
+                out << "return true;}())";
+                return out.str();
+            }
+
+            std::string historyEdgePossibility(std::vector<uint64_t> offsets, unsigned previous) const
+            {
+                std::sort(offsets.begin(), offsets.end());
+                offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
+                if (offsets.size() < 16) return {};
+                std::vector<std::pair<uint64_t, uint64_t>> ranges;
+                for (auto offset : offsets)
+                    if (!ranges.empty() && offset == ranges.back().first + ranges.back().second) ++ranges.back().second;
+                    else ranges.emplace_back(offset, 1);
+                if (ranges.size() * 4 > offsets.size()) return {};
+                std::ostringstream out;
+                out << "/* cpu_history_edge_scan histories=" << offsets.size() << " ranges=" << ranges.size() << " */ ";
+                if (ranges.size() == 1)
+                    out << "std::memchr(cpu_objects.get()+" << ranges[0].first << ',' << previous << ',' << ranges[0].second << ")!=nullptr";
+                else
+                {
+                    out << "([&](){static constexpr std::size_t cpu_history_ranges[][2]={";
+                    for (std::size_t i = 0; i < ranges.size(); ++i)
+                        out << (i ? "," : "") << '{' << ranges[i].first << ',' << ranges[i].second << '}';
+                    out << "};for(const auto &cpu_range:cpu_history_ranges)"
+                        << "if(std::memchr(cpu_objects.get()+cpu_range[0]," << previous << ",cpu_range[1]))return true;return false;}())";
+                }
+                return out.str();
+            }
+
+            std::string commitEdgePossibility(const CpuScheduledTask &task) const
+            {
+                if (task.execution != CpuExecution::DomainGatedCommit) return {};
+                const auto &tree = mapping_.partitionTree;
+                struct Term { CpuEvent event; bool byteHistories = true; std::vector<uint64_t> offsets; };
+                std::vector<Term> terms;
+                for (auto unit : tree.partitions[task.partition.index - 1].children)
+                    for (auto id : tree.partitions[unit.index - 1].ops)
+                    {
+                        const auto &op = model_.operations()[id.index - 1];
+                        const auto name = model_.text(op.opType);
+                        if (name != "core.state.regWrite" && name != "core.state.memWrite" &&
+                            name != "core.state.memFill" && name != "core.state.memWriteSeq") return {};
+                        const auto *edges = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
+                        if (!edges || edges->empty()) return {};
+                        const auto events = model_.operands(op).last(edges->size());
+                        const auto histories = model_.objectRefs(op).last(edges->size());
+                        for (std::size_t i = 0; i < edges->size(); ++i)
+                        {
+                            if ((*edges)[i] != "posedge" && (*edges)[i] != "negedge") return {};
+                            const CpuEvent event{events[i], (*edges)[i] == "posedge" ? CpuEventEdge::Posedge : CpuEventEdge::Negedge};
+                            const auto index = static_cast<std::size_t>(std::find_if(terms.begin(), terms.end(),
+                                [&](const auto &term) { return term.event == event; }) - terms.begin());
+                            if (index == terms.size()) terms.push_back({event});
+                            if (terms.size() > 8) return {};
+                            auto &term = terms[index];
+                            const auto &historyType = stateType({histories[i].index, histories[i].generation});
+                            const auto &slot = object(histories[i]);
+                            term.byteHistories &= historyType.kind == TypeKind::Logic && historyType.width == 1 &&
+                                !historyType.isSigned && historyType.domain == LogicDomain::TwoState && layout_.types[slot.type.index - 1].size == 1;
+                            term.offsets.push_back(slot.offset);
+                        }
+                    }
+                if (terms.empty()) return {};
+                std::string result = "false";
+                for (auto &term : terms)
+                {
+                    const bool negative = term.event.edge == CpuEventEdge::Negedge;
+                    const auto level = std::string(negative ? "!" : "") + value(term.event.value);
+                    // Inspect every current history, never a representative or a pending shadow.
+                    const auto history = term.byteHistories ? historyEdgePossibility(std::move(term.offsets), negative ? 1 : 0) : std::string{};
+                    result += " || " + (history.empty() ? level : "(" + level + " && (" + history + "))");
+                }
+                return result;
+            }
+
+            void taskBody(std::ostream &out, const CpuScheduledTask &task) const
+            {
+                out << "#include \"" << prefix_ << ".hpp\"\n";
+                if (task.execution == CpuExecution::ActivityDrivenCompute)
+                    for (const auto &function : model_.functions()) out << dpiDeclaration(function) << '\n';
+                out << "void " << class_ << "::cpu_task_" << task.id.index << "(){\n";
+                const auto &tree = mapping_.partitionTree;
+                if (task.execution != CpuExecution::ActivityDrivenCompute)
+                {
+                    if (const auto stable = stableCommitHistories(task); !stable.empty())
+                        out << "if(" << stable << ")return; // cpu_stable_history_skip task=" << task.id.index << '\n';
+                    const auto possibility = commitEdgePossibility(task);
+                    if (!possibility.empty())
+                    {
+                        out << "if(!(" << possibility << ")){ // cpu_inactive_edge_sample task=" << task.id.index << '\n';
+                        // A false edge still samples history, including writes that overwrite pending values.
+                        for (auto unit : tree.partitions[task.partition.index - 1].children)
+                            for (auto op : tree.partitions[unit.index - 1].ops) sampleEvents(out, model_.operations()[op.index - 1], 1);
+                        if (const auto batches = historyBatches_.find(task.id.index); batches != historyBatches_.end())
+                            for (const auto &batch : batches->second) sampleHistoryBatch(out, batch);
+                        out << "return;}\n";
+                    }
+                    for (auto unit : tree.partitions[task.partition.index - 1].children)
+                        for (auto op : tree.partitions[unit.index - 1].ops) commit(out, model_.operations()[op.index - 1]);
+                    // Private shadow writes commute; guards keep reading individual visible histories.
+                    if (const auto batches = historyBatches_.find(task.id.index); batches != historyBatches_.end())
+                        for (const auto &batch : batches->second) sampleHistoryBatch(out, batch);
+                }
+                else
+                    for (auto word : tree.partitions[task.partition.index - 1].children)
+                    {
+                        const auto offset = wordOffsets_[word.index];
+                        out << "{std::uint8_t cpu_active_word=cpu_flags[" << offset << "];if(cpu_active_word){cpu_flags[" << offset << "]=0;\n";
+                        for (auto unit : tree.partitions[word.index - 1].children)
+                        {
+                            const auto &partition = tree.partitions[unit.index - 1];
+                            out << "if(cpu_active_word&" << activeMasks_[unit.index] << "){cpu_active_word&=~" << activeMasks_[unit.index] << ";\n"
+                                << "alignas(8) std::byte cpu_local[" << std::max<uint64_t>(frameSizes_[unit.index], 1) << "]{};\n";
+                            // Strings outlive all helper calls for this supernode invocation.
+                            for (auto stringOffset : localStrings_[unit.index])
+                                out << "std::string cpu_string_" << stringOffset << ";cpu_at<std::string*>(cpu_local,"
+                                    << stringOffset << ")=&cpu_string_" << stringOffset << ";\n";
+                            if (!partition.attrs.helperChunks.empty())
+                                for (std::size_t i = 0; i < partition.attrs.helperChunks.size(); ++i)
+                                    out << "cpu_helper_" << unit.index << '_' << i << "(cpu_local,cpu_active_word);\n";
+                            else
+                            {
+                                std::vector<OpId> ops;
+                                for (auto node : partition.children)
+                                    ops.insert(ops.end(), tree.partitions[node.index - 1].ops.begin(), tree.partitions[node.index - 1].ops.end());
+                                computeGroup(out, ops, unit);
+                            }
+                            out << "}\n";
+                        }
+                        out << "cpu_flags[" << offset << "]|=cpu_active_word;}}\n";
+                    }
+                out << "}\n";
+                if (task.execution == CpuExecution::ActivityDrivenCompute)
+                    for (auto word : tree.partitions[task.partition.index - 1].children)
+                        for (auto unit : tree.partitions[word.index - 1].children)
+                        {
+                            const auto &partition = tree.partitions[unit.index - 1];
+                            if (partition.attrs.helperChunks.empty()) continue;
+                            std::vector<OpId> ops;
+                            for (auto node : partition.children) ops.insert(ops.end(), tree.partitions[node.index - 1].ops.begin(), tree.partitions[node.index - 1].ops.end());
+                            for (std::size_t i = 0; i < partition.attrs.helperChunks.size(); ++i)
+                            {
+                                out << "void " << class_ << "::cpu_helper_" << unit.index << '_' << i << "(std::byte *cpu_local,std::uint8_t &cpu_active_word){\n";
+                                const auto range = partition.attrs.helperChunks[i];
+                                computeGroup(out, std::span<const OpId>(ops).subspan(range.offset, range.count), unit);
+                                out << "}\n";
+                            }
+                        }
+            }
+
+            struct Target { uint32_t offset, mask; bool arm; };
+            const GrhSimModel &model_;
+            const CpuBackendMapping &mapping_;
+            const CpuDataLayout &layout_;
+            const CpuSchedulePlan &schedule_;
+            std::string prefix_, class_;
+            std::vector<uint32_t> wordOffsets_, armOffsets_;
+            std::vector<uint64_t> frameSizes_;
+            std::vector<std::vector<uint64_t>> localStrings_;
+            std::vector<std::pair<std::string_view, uint64_t>> persistentStrings_;
+            std::map<uint32_t, std::string> staticStrings_;
+            bool hasSystemTasks_ = false;
+            std::map<uint32_t, std::size_t> onceTasks_;
+            std::vector<uint32_t> activeOffsets_, activeMasks_;
+            std::vector<Range> stateRanges_;
+            std::vector<bool> projected_;
+            std::vector<const CpuActivationTargets *> fanout_;
+            std::vector<Target> stateTargets_;
+            std::vector<StateId> readAliases_;
+            std::vector<std::vector<PartitionId>> aliasConsumers_;
+            std::vector<PartitionId> computeOwners_;
+            std::vector<uint64_t> memoryDirtyBases_;
+            std::vector<Range> memoryRanges_;
+            std::vector<uint32_t> memoryReadIds_;
+            std::vector<Target> memoryReaders_;
+            uint64_t dirtyBytes_ = 0;
+            std::vector<bool> batchedHistories_;
+            std::vector<bool> directCommitStates_;
+            std::vector<bool> privateByteHistories_;
+            uint64_t directCommitCount_ = 0;
+            std::map<uint32_t, std::vector<HistoryBatch>> historyBatches_;
+            uint64_t historyCandidates_ = 0, historyPrivateRejected_ = 0, historyLayoutRejected_ = 0;
+            uint64_t historyBatchStates_ = 0, historyBatchCount_ = 0, historyMaxBatch_ = 0, historyMaxPattern_ = 0;
+        };
+
+        class EmitCppPass final : public Pass
+        {
+        public:
+            explicit EmitCppPass(std::filesystem::path path) : Pass("cpu.st.emit-cpp", PassKind::Emit), path_(std::move(path)) {}
+            PassResult run(GrhSimModel &model, diag::Diagnostics &diagnostics) override { return emitCpuCpp(model, path_, diagnostics); }
+        private:
+            std::filesystem::path path_;
+        };
+    }
+
+    PassResult emitCpuCpp(const GrhSimModel &model, const std::filesystem::path &directory, diag::Diagnostics &diagnostics)
+    {
+        if (!verifyGrhSimModel(model, defaultDialectRegistry(), diagnostics)) return {false, false, {}};
+        if (!model.cpuMapping() || model.cpuMapping()->stage != CpuMappingStage::Schedule)
+        { diagnostics.error("CPU C++ emit requires a complete schedule", "cpu.st.emit-cpp"); return {false, false, {}}; }
+        try
+        {
+            Emitter emitter(model); emitter.validate();
+            diagnostics.info(emitter.historyBatchSummary(), "cpu.st.emit-cpp");
+            return emitter.write(directory);
+        }
+        catch (const std::exception &error)
+        { diagnostics.error(error.what(), "cpu.st.emit-cpp"); return {false, false, {}}; }
+    }
+
+    void registerCpuEmitPasses(PassRegistry &registry)
+    {
+        std::string error;
+        if (!registry.registerPass("cpu.st.emit-cpp", PassKind::Emit,
+            [](std::span<const std::string_view> args, std::string &error) -> std::unique_ptr<Pass> {
+                if (args.size() != 2 || args[0] != "--output" || args[1].empty())
+                { error = "expected --output <empty-directory>"; return {}; }
+                return std::make_unique<EmitCppPass>(std::filesystem::path(args[1]));
+            }, error)) throw std::logic_error(error);
+    }
+}

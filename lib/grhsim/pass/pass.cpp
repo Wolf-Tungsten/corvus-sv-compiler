@@ -1,4 +1,5 @@
 #include "grhsim/pass/pass.hpp"
+#include "grhsim/backend/cpu.hpp"
 
 #include "grhsim/dialect/registry.hpp"
 #include "grhsim/ir/model.hpp"
@@ -151,6 +152,7 @@ namespace wolvrix::lib::grhsim
     PassRegistry makeDefaultPassRegistry()
     {
         PassRegistry registry;
+        registerCpuPasses(registry);
         std::string error;
         registry.registerPass(
             "grhsim.verify", PassKind::Analysis,
