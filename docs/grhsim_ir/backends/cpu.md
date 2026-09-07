@@ -3,6 +3,8 @@
 本文定义 CPU 后端的映射结构 `CpuBackendMapping`。[GrhSIM IR Overview](../overview.md)
 定义通用模型和后端边界；本文中的三个分量仅属于 CPU 后端，不是其他后端必须采用的结构。
 
+从模型输入到构建、运行和验收的步骤见 [CPU 单线程活动度仿真 Flow](../flows/cpu-st.md)。
+
 ## 1. `CpuBackendMapping`
 
 ```text

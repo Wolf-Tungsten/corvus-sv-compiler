@@ -1,0 +1,255 @@
+# CPU 单线程活动度仿真 Flow
+
+本文规定 `cpu.st.*` 的端到端流程：从已验证的 `GrhSimModel` 构建 CPU mapping，生成
+C++ 模型，再验证多时钟行为与运行性能。`st` 表示单线程，不表示单时钟。
+
+模型语义以 [Overview](../overview.md) 和 [Core Dialect](../dialects/core.md) 为准；
+mapping 字段、默认参数和 emitter 约束以 [CPU 后端](../backends/cpu.md) 为准。
+本文负责组织各阶段的输入、输出和验收，不另建一份 schema，也不保存逐次实验日志。
+
+## 1. 范围与产物
+
+当前路线已实现 compute/commit、活动度传播、输入与派生事件域、数据布局、调度和 C++ emit。
+运行时使用一个 NUMA node、一个 CPU core；调用方改变输入后调用 `eval()`，不要求存在名为
+`clock` 的端口，也不把一次 `eval()` 等同于一个硬件时钟周期。
+
+输入是包含 `I/O/S/F/G/Init` 的合法模型。`Init` 必须完整定义状态初值；GRH lowering 和
+前置变换在进入本 flow 前完成。产物包括：
+
+- 携带完整 `CpuBackendMapping` 的模型及可重新加载的 JSON checkpoint。
+- C++ 模型头文件、共享 runtime、driver、初始化和 task 源文件，以及生成目录内的 Makefile。
+- 与模型、mapping、编译参数和实际可执行文件对应的功能与性能验证记录。
+
+当前 C++ emitter 的主要逻辑路径为 two-state；mapping 支持某种物理类型不等于 emitter
+已支持其全部操作。four-state、`memAssign`、字符串状态等未实现路径必须显式拒绝。
+waveform/runtime profile、多线程和 fullpass 不属于本 flow 已验收的能力。
+
+## 2. 构建流水线
+
+按下表顺序执行。前八步只生成或推进 CPU mapping，不改写语义 op、value 或 `Init`；
+最后一步只读消费完整 mapping。不得通过 session 隐藏状态传递后端决策。
+
+| 阶段 | Pass | 主要产物 |
+| --- | --- | --- |
+| 相位 | `cpu.st.split-phase` | root 下唯一的 compute/commit 两枝 |
+| 事件域 | `cpu.st.form-event-domains` | commit 事件域及域内写口 supernode |
+| 计算节点 | `cpu.st.build-compute-nodes` | 拓扑有序的 compute node |
+| 活动度单元 | `cpu.st.merge-compute-supernodes` | coarsen + DP 聚合的 compute supernode |
+| 活动字 | `cpu.st.pack-active-words` | active ID、每字 8 个 supernode、helper ranges |
+| 函数 | `cpu.st.pack-emit-functions` | compute/commit 的生成函数边界 |
+| 布局 | `cpu.st.layout-data` | object、local、boundary 和运行态槽位 |
+| 调度 | `cpu.st.build-schedule` | task 顺序、执行条件、fanout、round seeds、input shadows |
+| 发射 | `cpu.st.emit-cpp` | C++ 模型与 Makefile，要求输出目录为空 |
+
+最终分区树为：
+
+```text
+root
+  compute
+    emit_function
+      active_word
+        supernode
+          node -> ops
+  commit
+    event_domain
+      emit_function
+        supernode -> ops
+```
+
+这些是同一 `PartitionTree` 的层次，不是独立的 Domain/Word/Function graph 实体。
+supernode 决定活动度粒度；函数决定代码组织，不能为了减少函数数而扩大调度粒度。
+TU 归属不进入 mapping；当前 emitter 为每个 task 输出一个源文件，未来 TU 打包仍属 emit 决策。
+
+只有 Schedule stage 的 mapping 才是 `complete=true`。各阶段校验对应的不变量；
+semantic revision 改变后旧 mapping 失效，必须重新生成，不能只补最后一个 pass。
+
+## 3. 相位和事件域
+
+commit 分类包含 `core.state.regWrite`、`latchWrite`、`memWrite`、`memFill`、
+`memAssign`、`memWriteSeq`。分类并不放宽 emitter 的支持范围，例如 `memAssign` 当前仍被拒绝。
+其他 op 属于 compute，包括 `core.system.task` 和 `core.dpi.call`。
+
+事件域的 canonical key 仅由 `(edge, ValueId)` 集合构成，排序去重后相同的写口归入同域。
+update condition、data、mask 和 history StateId 不进入 key。全部事件值由 input.read 产生
+时 source 为 input，否则为 derived；同时引用输入和派生事件的域也属于 derived。
+无边沿写口和 latch 放入无 event gate 的 general 域。
+
+例如一个带异步复位的寄存器写口：
+
+```text
+operands   = [enable, next, mask, clk, reset]
+objectRefs = [q, clkHistory, resetHistory]
+event_edges = [posedge, posedge]
+```
+
+`enable` 是数据更新条件，`next` 是写入数据，`mask` 选择写入位；`clk/reset` 是事件值，
+两个 history 各保存该 op 对应事件的旧值。域 key 只含 `(posedge, clk)` 与
+`(posedge, reset)`；守卫是两个边沿的析取，再与 enable 组合决定是否写数据。
+即使 enable 为假，仍须采样两个 history。
+
+不得预设 XiangShan 只有一个边沿域，也不得假设同一 state 只有一个写口。域统计应来自
+实际 IR；多个写口完整保留，合法性和覆盖规则遵守 core 方言。`memWriteSeq` 的有序三元组
+在同一个 op 内处理，分区或函数打包不得拆散它。
+
+DPI 保持 compute 侧的 `callCond && eventGuard`：有无返回值不决定其相位，没有结果的调用
+不能被删除，没有 event 时 event guard 为真。history 采样不受 callCond 限制；未触发时结果保持。
+
+## 4. 分区、布局和调度的衔接
+
+compute node 由依赖关系和容量边界形成；coarsen/DP 合并后仍须保证展开顺序为合法 DAG。
+word 只存在于 compute 枝，active ID 连续分配。helper ranges 覆盖一个 supernode 的展开 op
+序列，不是模型 OpId 范围，也不是新的调度单元。
+
+函数打包只能聚合完整 word 或同域 commit supernode。`target_batch_count` 是函数数量的
+软目标，不是编译规模硬保证：当前非零值会按总 ops/lines 除以目标数放大阈值，0 则不启用
+该调整。默认值为 64。改变此参数必须单独记录并重新验证编译，不能仅凭函数数接近 legacy
+就认定 emit 结构或编译成本已一致。
+
+DataLayout 在最终分区后生成。跨 supernode、compute 到 commit、事件值和需保持的 DPI 结果
+使用持久存储；其余可用 partition-local 槽。布局完整性不能代替 emitter 的类型支持检查。
+
+SchedulePlan 的单核 task 序列先 compute 后 commit，每个函数对应一个 task，`waitsFor` 为空。
+执行条件与激活关系分开表示：
+
+| 执行条件 | 行为 |
+| --- | --- |
+| `ActivityDrivenCompute` | 调用函数后按 word/bit 派发活动 supernode |
+| `DomainGatedCommit` | 域 arm 为真才进入函数，内部仍逐 op 精判 event guard |
+| `AlwaysScanCommit` | general 域每轮进入，保留原写口守卫 |
+
+| 激活表 | 触发源与用途 |
+| --- | --- |
+| `inputFanout` | 输入 read value 的任意变化，激活生产者/消费者并 arm 引用它的域 |
+| `computeSupernodeFanout` | compute value 真变化，激活跨 supernode 消费者或 arm 派生事件域 |
+| `commitStateFanout` | E 中的状态最终真变化，激活状态读者及相关 history 消费者，并决定继续迭代 |
+
+`activate` 只能指向 compute supernode，`arm` 只能指向 commit 事件域。commit 不使用
+per-write/per-supernode 的 compute 活动位，不能将域级门控扩展成稠密的 state × domain 表。
+posedge 域也必须观察下降沿，以便 history 回到 0；不能只在所需边沿方向上传播 arm。
+
+`commitStateFanout` 的 key 集合是从输出和边沿判定反推的状态闭包 E。遍历状态读后还要穿过
+该状态的写口，不能遗漏间接依赖，也不能把所有状态都加入 E。非 E 状态读者和具有外部观察
+语义的 system/DPI 单元通过 `roundSeeds` 保守逐轮执行。`inputShadows` 与输入表逐项对应。
+
+## 5. 运行时 Flow
+
+初始化应用全部 `Init` 步骤，清除 pending/dirty/read-address 缓存，激活全部 compute 单元，
+并 arm 全部边沿域。每次 `eval()` 固定外部输入，然后执行：
+
+```text
+加载并归一化输入
+对 inputFanout 所列输入做差分，更新 shadow，产生 activate / 当前轮 arm
+重复执行 G：
+  注入 roundSeeds
+  compute：按 task、word、supernode 顺序求值并传播变化
+  commit：域级 arm 筛选后精判写口守卫，登记状态更新
+  publish：应用最终更新，比较 E，激活读者并产生下一轮 arm
+  将下一轮 arm 转交当前轮，清空下一轮缓冲
+  若 E 未变化，刷新对外输出并返回
+超过收敛轮数上限则报告错误
+```
+
+当前 C++ emitter 的收敛保护上限为 100000 轮。活动字中，后序 bit 可以在同字局部 flags 中
+立即激活；当前或前序 bit 留在全局待后续扫描，不能把它们清掉。
+
+history 是普通状态更新的一部分：每轮 G 的守卫读取该轮旧 history，采样随该轮 publish
+生效，**不是冻结到整个 eval 结束**。当前轮 arm 与下一轮 arm 分开消费，轮末清理不能丢失
+publish 刚产生的唤醒。DPI/system task 在 compute 中登记的 history 也参与同一发布过程。
+
+例如派生时钟 `g = clk & en` 从 0 变为 1，会在 compute 中 arm 使用 g 的域；该域精判
+`!gHistory && g` 后写状态，并采样 gHistory=1。下一轮 G 看到的是新 history，不会把同一
+电平再次误判为上升沿。随后 g 的下降也须唤醒该域采样 history，为下次上升做好准备。
+
+## 6. Emit 约束与优化边界
+
+以下优化可以改变 C++ 形态，但不能改变上述 G 转移、E 或调用语义：
+
+- compute-only 的安全 state-read 别名可省去复制，但必须补齐直接消费者的状态激活关系；
+  直接作为 commit operand 的值保留旧快照，例如 `q1 <= d; q2 <= q1` 不得读取提前更新的 q1。
+- 同一 supernode/helper chunk 内相同 fanout 的逻辑结果合并 changed，再统一发布 mask。
+  宽位 helper 沿用 legacy 的指针、调用者 out-buffer 和原地计算，不增加整块旧值快照。
+- 标量 direct commit 只用于经证明不会被其他 commit 观察的私有单写者；其余保留 deferred
+  publication。不能从“通常只有一个写口”推导这一优化。
+- 内存按 cell 暂存和发布，多写口复用同轮该行 shadow，保留 mask 和有序覆盖；fill 与
+  sequence 写也使用同一路径。读端口缓存实际地址，发布时只激活匹配行的读者所属单元。
+- history batching、稳定历史跳过和 inactive-edge sampling 必须保持各 op 独立的 history
+  与守卫；不能用一个代表 history 替代整组状态。
+
+fullpass 不是当前默认路线。只有在功能正确、已有 profile 将差距归因到激活检查/传播后，
+才可单独设计并验证快速路径；不能以忽略多时钟、混合边沿或派生事件来换取单时钟结果。
+
+## 7. 验证与验收
+
+每阶段先验证结构，再验证生成物行为，最后才做性能结论：
+
+1. 检查 phase/event 覆盖、拓扑顺序、supernode/word/function 边界和 helper ranges。
+2. 检查布局、三张 fanout、E 闭包、roundSeeds 和 task 覆盖；fresh-session JSON roundtrip
+   不得依赖旧 session 的隐藏状态。
+3. 运行生成 C++ 回归，覆盖 inline/helper、宽窄值、init/reset、DPI、掩码/多写口和读旧写新。
+4. 使用多时钟记分板和 Verilator 对照，覆盖双域同时触发、混合边沿、派生/门控时钟、latch、
+   异步复位、重复 eval 和 memory read-before-write。现有 `cpu_cdc`、`cpu_dual_ram` 是此类门禁，
+   不代表模拟了硬件亚稳态，也不能替代 ingest 集成验证。
+5. HDLBits 全量通过后，用 XiangShan CoreMark/NEMU 做完整 50k 对拍，比较全部有序采样和终态，
+   不以局部样本或“未报错”代替最终退出结果。
+6. 功能通过后比较普通 O3 可执行文件的串行同参耗时。记录模型/二进制指纹、packing、编译参数、
+   image、NEMU、seed、waveform 和进度输出设置；测量不得与构建或其他仿真重叠。
+
+legacy 是代码结构与性能的参考，不是可以直接套用的规模假设。对照分区数量级、实际表达式/
+临时存储/变化发布、helper 的数据搬运三方面，并分别检查编译时间与运行时间。
+50k 耗时不超过同条件 legacy 的 105% 是性能目标，**不是目前已满足的保证**。
+功能通过、完整 mapping 或本轮三处 emit 修复，都不能替代该性能验收。
+
+## 8. 项目执行入口
+
+下列目标属于集成仓库 `wolvrix-playground/Makefile`，不是 wolvrix 子仓库根目录的命令。
+先在集成仓库根目录加载项目环境；构建、安装、测试和仿真一律使用 Makefile 入口，不手工
+拼接 CMake、编译器、链接器或 Python 构建命令。临时输出放项目内 `ptmp/`。
+
+```sh
+mkdir -p ptmp/cpu-st-tmp ptmp/cpu-st-ccache
+export TMPDIR="$PWD/ptmp/cpu-st-tmp"
+export CCACHE_DIR="$PWD/ptmp/cpu-st-ccache"
+make test_grhsim_cpu_mapping
+make test_grhsim_cpu_schedule
+make test_grhsim_cpu_emit
+make py_install
+make run_all_hdlbits_grhsim_ir_tests SKIP_PY_INSTALL=1
+```
+
+生成新的 XS 模型时选择独立、尚不存在或为空的输出目录；要复用 flat checkpoint，显式设置
+`XS_WOLF_GRHSIM_IR_RESUME_FROM_FLAT_GRH_JSON=1` 和其输入路径。`XS_WOLF_GRHSIM_IR_CPU_TARGET_BATCH_COUNT`
+是 packing 覆盖项，未设置时使用默认值；用于 A/B 时必须记录，不能静默改动。
+
+```sh
+make xs_wolf_grhsim_ir XS_GRHSIM_IR_BUILD=ptmp/cpu_st \
+  XS_WOLF_GRHSIM_IR_EMIT_CPP_DIR=ptmp/cpu_st/model XS_LOG_DIR=ptmp
+make xs_wolf_grhsim_ir_build_emu XS_GRHSIM_IR_BUILD=ptmp/cpu_st \
+  XS_WOLF_GRHSIM_IR_EMIT_CPP_DIR=ptmp/cpu_st/model VM_BUILD_JOBS=8
+```
+
+构建结束并确认无遗留构建/仿真进程后，以下两个 run-only 目标按顺序执行，不并行：
+
+```sh
+make run_xs_wolf_grhsim_ir_emu XS_GRHSIM_IR_BUILD=ptmp/cpu_st \
+  XS_SIM_MAX_CYCLE=50000 XS_WAVEFORM=0 XS_WAVEFORM_PATH= \
+  XS_PROGRESS_EVERY_CYCLES=1000 XS_LOG_DIR=ptmp RUN_ID=cpu_st_50k
+make run_xs_wolf_grhsim_emu XS_GRHSIM_BUILD=build/xs/grhsim \
+  XS_SIM_MAX_CYCLE=50000 XS_WAVEFORM=0 XS_WAVEFORM_PATH= \
+  XS_PROGRESS_EVERY_CYCLES=1000 XS_LOG_DIR=ptmp RUN_ID=legacy_cpu_st_50k
+```
+
+第二条命令要求指定目录中已有匹配配置的 legacy 可执行文件。复测使用新的 RUN_ID，保留
+上一候选及其日志；某个进程观察超时不等于构建失败，不得因此重复启动同一任务。
+
+## 9. 实现索引
+
+- [相位和事件域](../../../lib/grhsim/backend/cpu.cpp)
+- [node、supernode、word 和函数打包](../../../lib/grhsim/backend/cpu_partition.cpp)
+- [数据布局](../../../lib/grhsim/backend/cpu_layout.cpp)
+- [调度与激活关系](../../../lib/grhsim/backend/cpu_schedule.cpp)
+- [C++ emitter](../../../lib/grhsim/backend/cpu_emit.cpp)
+- [CPU mapping 回归](../../../tests/grhsim/test_cpu_mapping.cpp)
+- [调度回归](../../../tests/grhsim/test_cpu_schedule.cpp)
+- [生成代码回归](../../../tests/grhsim/test_cpu_emit.cpp)
+- [Legacy 活动度调度](../../transform/activity-schedule.md)
+- [Legacy GrhSIM 调度](../../emit/grhsim-scheduling.md)

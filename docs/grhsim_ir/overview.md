@@ -304,6 +304,8 @@ GrhSIM IR pass 可以改写 `GrhSimModel` 的语义分量，也可以创建或�
 
 ## 8. 文档
 
+- [Flows](./flows/README.md)
+- [CPU 单线程活动度仿真 Flow](./flows/cpu-st.md)
 - [Core Dialect](./dialects/core.md)
 - [CPU Dialect](./dialects/cpu.md)
 - [CPU 后端](./backends/cpu.md)

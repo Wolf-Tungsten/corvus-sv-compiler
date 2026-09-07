@@ -146,6 +146,7 @@ pass manager 绝不返回 `mappings` 为空或包含失效、不完整映射的 
 
 ## 7. 文档
 
+- [CPU 单线程活动度仿真 Flow](../flows/cpu-st.md)
 - [GrhSIM IR Overview](../overview.md)
 - [Core Dialect](../dialects/core.md)
 - [CPU 后端](../backends/cpu.md)
