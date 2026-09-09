@@ -26,6 +26,18 @@ waveform/runtime profile、多线程和 fullpass 不属于本 flow 已验收的�
 
 ## 2. 构建流水线
 
+GRH 入口使用 `lower_grhsim(..., logic_domain="2-state")`。对没有 defining op、仍被引用的
+logic value，lower 显式生成同位宽、同有符号属性的 `core.compute.constant` 零值 producer，
+与 legacy 二态仿真的零初始化一致。例如关闭 `RANDOMIZE_REG_INIT` 时，
+`reg [7:0] debug; assign y = {debug, data};` 中没有其他赋值的 `debug` 会成为
+`debug = core.compute.constant(constValue="8'h0")`，concat 继续读取该 value。
+此 constant 无 operand，唯一 result 是原 undriven value；`constValue` 保存其定宽零字面量。
+外部 input 和 inout 输入侧由 `core.input.read` 提供 producer，不补零；没有引用的 detached
+value 继续跳过。四态或非 logic 的 undriven value 仍报错，不默认为二态零。
+
+XiangShan 入口在 lower 成功后执行 GrhSIM IR 侧 `grhsim.reg-to-mem`，再进入下表的
+CPU mapping；这不依赖 GRH 侧 reg-to-mem。
+
 按下表顺序执行。前八步只生成或推进 CPU mapping，不改写语义 op、value 或 `Init`；
 最后一步只读消费完整 mapping。不得通过 session 隐藏状态传递后端决策。
 

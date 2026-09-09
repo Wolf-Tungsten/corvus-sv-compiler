@@ -364,6 +364,23 @@ namespace wolvrix::lib::grhsim
             valueMap[valueId.index] = model->addValue(
                 valueType(*model, *graph, valueId, options.logicDomain),
                 options.keepOrigins ? value.symbolText() : std::string_view{}, origin);
+            if (value.definingOp().valid() || value.isInput()) continue;
+            const auto inoutPorts = graph->inoutPorts();
+            if (std::any_of(inoutPorts.begin(), inoutPorts.end(),
+                            [valueId](const InoutPort &port) { return port.in == valueId; }))
+                continue;
+            if (options.logicDomain != LogicDomain::TwoState || value.type() != ValueType::Logic)
+            {
+                diagnostics.error("undriven GRH value requires 2-state logic lowering",
+                                  std::string(value.symbolText()));
+                continue;
+            }
+            // Match legacy zero-initialized storage for referenced undriven logic.
+            const std::array results{valueMap[valueId.index]};
+            const std::array parameters{Parameter{model->intern("constValue"),
+                std::to_string(std::max<int32_t>(1, value.width())) + "'h0"}};
+            model->addOperation("core.compute.constant", {}, results, {}, parameters,
+                                options.keepOrigins ? value.symbolText() : std::string_view{}, origin);
         }
 
         auto mappedValue = [&](grh::ValueId value, std::string_view context) -> grhsim::ValueId {

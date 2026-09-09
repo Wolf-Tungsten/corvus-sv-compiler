@@ -5,6 +5,8 @@
 #include "grhsim/ir/verifier.hpp"
 #include "grhsim/pass/pass.hpp"
 
+#include "slang/numeric/SVInt.h"
+
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -215,7 +217,7 @@ namespace
             }
             diag::Diagnostics diagnostics;
             grhsim::GrhToGrhSimOptions options; options.top = "top";
-            options.logicDomain = grhsim::LogicDomain::TwoState;
+            options.logicDomain = grhsim::LogicDomain::FourState;
             const auto model = grhsim::lowerGrhToGrhSim(design, options, diagnostics);
             if (mode == 0)
             {
@@ -223,6 +225,66 @@ namespace
                     return fail("detached value was not skipped or unused input/producer was removed");
             }
             else if (model || !diagnostics.hasError()) return fail("referenced undriven value was silently dropped");
+        }
+        return 0;
+    }
+
+    int runUndrivenTwoStateTest()
+    {
+        for (const int32_t width : {1, 8, 137})
+        for (const bool keepOrigins : {false, true})
+        {
+            grh::Design design;
+            auto &graph = design.createGraph("top");
+            design.markAsTop("top");
+            const auto input = graph.createValue(graph.internSymbol("input"), width, true);
+            graph.bindInputPort("input", input);
+            const auto floating = graph.createValue(graph.internSymbol("floating"), width, true);
+            graph.bindOutputPort("floating", floating);
+            // ROB debug fields remain concat operands when RANDOMIZE_REG_INIT is off.
+            const auto joined = graph.createValue(graph.internSymbol("joined"), 2 * width, false);
+            const auto concat = graph.createOperation(grh::OperationKind::kConcat);
+            graph.addOperand(concat, floating);
+            graph.addOperand(concat, input);
+            graph.addResult(concat, joined);
+            graph.bindOutputPort("joined", joined);
+            const auto busInput = graph.createValue(graph.internSymbol("bus_in"), width, true);
+            const auto busOutput = graph.createValue(graph.internSymbol("bus_out"), width, true);
+            const auto enable = graph.createValue(graph.internSymbol("bus_oe"), 1, false);
+            graph.bindInoutPort("bus", busInput, busOutput, enable);
+            graph.createValue(graph.internSymbol("detached"), width, false);
+
+            diag::Diagnostics diagnostics;
+            grhsim::GrhToGrhSimOptions options;
+            options.top = "top";
+            options.logicDomain = grhsim::LogicDomain::TwoState;
+            options.keepOrigins = keepOrigins;
+            const auto model = grhsim::lowerGrhToGrhSim(design, options, diagnostics);
+            if (!model || diagnostics.hasError()) return fail("undriven two-state logic did not lower");
+            unsigned constants = 0;
+            unsigned inputs = 0;
+            for (const auto &op : model->operations())
+            {
+                if (model->text(op.opType) == "core.input.read") ++inputs;
+                if (model->text(op.opType) != "core.compute.constant") continue;
+                ++constants;
+                const auto &value = model->values()[model->results(op).front().index - 1];
+                const auto &type = model->types()[value.type.index - 1];
+                const auto params = model->parameters(op);
+                if (params.size() != 1) return fail("undriven constant has no unique literal");
+                const auto *text = std::get_if<std::string>(&params.front().value);
+                if (!text) return fail("undriven constant literal is not a string");
+                const auto literal = slang::SVInt::fromString(*text);
+                if (literal.hasUnknown() || literal.countOnes() != 0 || literal.getBitWidth() != type.width)
+                    return fail("undriven constant is not a width-correct two-state zero");
+                if (type.domain != grhsim::LogicDomain::TwoState ||
+                    (type.isSigned ? type.width != static_cast<uint32_t>(width) : type.width != 1))
+                    return fail("undriven lowering changed the value type");
+                if (keepOrigins != value.origin.valid() || keepOrigins != op.origin.valid())
+                    return fail("undriven producer lost its optional source origin");
+            }
+            if (constants != 3 || inputs != 2 || model->values().size() != 6)
+                return fail("undriven lowering duplicated a producer, zeroed an input, or retained a detached value");
         }
         return 0;
     }
@@ -253,6 +315,7 @@ int main()
         if (const int status = runRoundTripTest(WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR); status != 0)
             return status;
         if (const int status = runDetachedValueTest(); status != 0) return status;
+        if (const int status = runUndrivenTwoStateTest(); status != 0) return status;
         return runHierarchyRejectionTest();
     }
     catch (const std::exception &ex)
