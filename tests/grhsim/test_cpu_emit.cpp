@@ -69,6 +69,41 @@ namespace
         return count;
     }
 
+    unsigned checkActivityGuards(const GrhSimModel &model, const std::filesystem::path &directory)
+    {
+        std::string source;
+        for (const auto &entry : std::filesystem::directory_iterator(directory))
+            if (entry.path().extension() == ".cpp")
+            {
+                std::ifstream stream(entry.path());
+                source.append(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+            }
+        const auto &mapping = *model.cpuMapping();
+        const auto &tree = mapping.partitionTree;
+        const auto &layout = *mapping.dataLayout;
+        std::vector<uint64_t> wordOffsets(tree.partitions.size() + 1);
+        for (const auto &slot : layout.runtime)
+            if (slot.kind == CpuRuntimeKind::ActiveWord) wordOffsets[slot.owner.index] = slot.offset;
+        unsigned count = 0;
+        for (const auto &task : mapping.schedule->numaNodes[0].cores[0].tasks)
+        {
+            if (task.execution != CpuExecution::ActivityDrivenCompute) continue;
+            std::string expected = "if(";
+            bool first = true;
+            for (const auto word : tree.partitions[task.partition.index - 1].children)
+            {
+                if (!first) expected += "||";
+                expected += "cpu_flags[" + std::to_string(wordOffsets[word.index]) + "]";
+                first = false;
+            }
+            expected += ")cpu_task_" + std::to_string(task.id.index) + "();";
+            require(source.find(expected) != std::string::npos, "activity-driven task is missing its outer activity guard");
+            ++count;
+        }
+        require(count != 0, "fixture did not produce an activity-driven task");
+        return count;
+    }
+
     GrhSimModel fixture()
     {
         GrhSimModel model("cpu_chain"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -1349,6 +1384,7 @@ int main(int argc, char **argv)
         require(result.success && !result.changed && model.semanticRevision() == revision && !result.artifacts.empty(), "emit mutated IR or failed");
         require(emittedDirectStates(directory) == std::set<uint32_t>{1, 2, 3, 4, 5}, "private commit accepted multiple writers or missed a private register/latch");
         require(checkSamplingTasks(model, directory) == 3, "input/derived/mixed-edge sampling path coverage differs");
+        require(checkActivityGuards(model, directory) != 0, "activity-driven task guard coverage differs");
         diag::Diagnostics repeated;
         require(!emitCpuCpp(model, directory, repeated).success, "emit overwrote nonempty directory");
         testStartup(directory / "startup");

@@ -1681,7 +1681,19 @@ inline bool cpu_shift_words_changed(const std::uint64_t *value, std::size_t valu
                 CpuActivationTargets seeds{schedule_.roundSeeds, {}}; activate(out, seeds, false);
                 for (const auto &task : schedule_.numaNodes[0].cores[0].tasks)
                 {
-                    if (task.execution == CpuExecution::DomainGatedCommit)
+                    if (task.execution == CpuExecution::ActivityDrivenCompute)
+                    {
+                        out << "if(";
+                        bool first = true;
+                        for (const auto word : mapping_.partitionTree.partitions[task.partition.index - 1].children)
+                        {
+                            if (!first) out << "||";
+                            out << "cpu_flags[" << wordOffsets_[word.index] << "]";
+                            first = false;
+                        }
+                        out << ")";
+                    }
+                    else if (task.execution == CpuExecution::DomainGatedCommit)
                         out << "if(cpu_flags[" << armOffsets_[mapping_.partitionTree.partitions[task.partition.index - 1].parent.index] << "])";
                     out << "cpu_task_" << task.id.index << "();\n";
                 }
