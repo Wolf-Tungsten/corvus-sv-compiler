@@ -420,6 +420,7 @@ namespace wolvrix::lib::grhsim
                     for (auto [history, representative] : aliases) historyAliases_[history.index] = representative;
                     sharedHistoryCount_ += aliases.size();
                     ++sharedHistoryTasks_;
+                    sharedHistoryTaskIds_.insert(task.id.index);
                 }
             }
 
@@ -1429,7 +1430,7 @@ namespace wolvrix::lib::grhsim
                     (projected_[target.index] ? "true" : "false") + ")";
             }
 
-            void commit(std::ostream &out, const SimOp &op) const
+            void commit(std::ostream &out, const SimOp &op, const std::string &cachedGuard = {}) const
             {
                 const auto operands = model_.operands(op); const auto refs = model_.objectRefs(op);
                 const auto opName = model_.text(op.opType);
@@ -1450,6 +1451,7 @@ namespace wolvrix::lib::grhsim
                         guard += " || (" + std::string((*edges)[i] == "posedge" ? "!" : "") + state(history) + " && " +
                                  ((*edges)[i] == "negedge" ? "!" : "") + event + ")";
                     }
+                    if (!cachedGuard.empty()) guard = cachedGuard;
                     out << "if((" << guard << ") && " << value(operands[0]) << "){ for(std::size_t i=0;i<" << array.count << ";++i) "
                         << "cpu_at<" << cppType(element) << ">(" << stageCell(target, "i") << ",0)="
                         << normalize(value(operands[1]), element) << "; }\n";
@@ -1474,6 +1476,7 @@ namespace wolvrix::lib::grhsim
                         guard += " || (" + std::string((*edges)[i] == "posedge" ? "!" : "") + state(history) + " && " +
                                  ((*edges)[i] == "negedge" ? "!" : "") + event + ")";
                     }
+                    if (!cachedGuard.empty()) guard = cachedGuard;
                     out << "if((" << guard << ") && " << value(operands[0]) << " && static_cast<std::size_t>("
                         << value(operands[1]) << ")<" << array.count << "){\n";
                     out << "auto &cpu_cell=cpu_at<" << cppType(element) << ">(" << stageCell(target, value(operands[1])) << ",0);\n";
@@ -1505,6 +1508,7 @@ namespace wolvrix::lib::grhsim
                         guard += " || (" + std::string((*edges)[i] == "posedge" ? "!" : "") + state(history) + " && " +
                                  ((*edges)[i] == "negedge" ? "!" : "") + event + ")";
                     }
+                    if (!cachedGuard.empty()) guard = cachedGuard;
                     out << "if(" << guard << "){\n";
                     for (std::size_t i = 0; i < operands.size() - eventCount; i += 3)
                         out << "if(" << value(operands[i]) << " && static_cast<std::size_t>(" << value(operands[i + 1]) << ")<"
@@ -1525,6 +1529,7 @@ namespace wolvrix::lib::grhsim
                         guard += " || (" + std::string((*edges)[i] == "posedge" ? "!" : "") + state(history) + " && " +
                                  ((*edges)[i] == "negedge" ? "!" : "") + event + ")";
                     }
+                if (!cachedGuard.empty()) guard = cachedGuard;
                 out << "if((" << guard << ") && " << value(operands[0]) << "){\n";
                 const StateId target{refs[0].index, 0}; const auto range = stateRanges_[target.index];
                 if (directCommitStates_[target.index])
@@ -1986,6 +1991,41 @@ if(terminal){
                 return result;
             }
 
+            std::map<uint32_t, std::string> commitEdgeSnapshots(std::ostream &out, const CpuScheduledTask &task) const
+            {
+                std::map<uint32_t, std::string> guards;
+                if (!sharedHistoryTaskIds_.contains(task.id.index)) return guards;
+                using Key = std::vector<std::tuple<uint32_t, uint32_t, std::string>>;
+                std::map<Key, std::vector<OpId>> groups;
+                const auto &tree = mapping_.partitionTree;
+                for (auto unit : tree.partitions[task.partition.index - 1].children)
+                    for (auto id : tree.partitions[unit.index - 1].ops)
+                    {
+                        const auto &op = model_.operations()[id.index - 1];
+                        const auto &edges = *parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
+                        const auto events = model_.operands(op).last(edges.size());
+                        const auto histories = model_.objectRefs(op).last(edges.size());
+                        Key key;
+                        for (std::size_t i = 0; i < edges.size(); ++i)
+                        {
+                            const auto alias = historyAliases_[histories[i].index];
+                            key.emplace_back(events[i].index, alias ? alias.index : histories[i].index, edges[i]);
+                        }
+                        groups[std::move(key)].push_back(id);
+                    }
+                std::size_t index = 0;
+                for (const auto &[key, ops] : groups)
+                {
+                    if (ops.size() < 2) continue;
+                    const auto name = "cpu_edge_snapshot_" + std::to_string(index++);
+                    // Private visible histories and boundary events cannot change during this commit task.
+                    out << "const bool " << name << "=(" << eventGuard(model_.operations()[ops.front().index - 1], 1)
+                        << "); // cpu_edge_snapshot uses=" << ops.size() << '\n';
+                    for (auto id : ops) guards.emplace(id.index, name);
+                }
+                return guards;
+            }
+
             void taskBody(std::ostream &out, const CpuScheduledTask &task) const
             {
                 out << "#include \"" << prefix_ << ".hpp\"\n";
@@ -2008,8 +2048,13 @@ if(terminal){
                             for (const auto &batch : batches->second) sampleHistoryBatch(out, batch);
                         out << "return;}\n";
                     }
+                    const auto guards = commitEdgeSnapshots(out, task);
                     for (auto unit : tree.partitions[task.partition.index - 1].children)
-                        for (auto op : tree.partitions[unit.index - 1].ops) commit(out, model_.operations()[op.index - 1]);
+                        for (auto op : tree.partitions[unit.index - 1].ops)
+                        {
+                            const auto guard = guards.find(op.index);
+                            commit(out, model_.operations()[op.index - 1], guard == guards.end() ? std::string{} : guard->second);
+                        }
                     // Private shadow writes commute; guards keep reading individual visible histories.
                     if (const auto batches = historyBatches_.find(task.id.index); batches != historyBatches_.end())
                         for (const auto &batch : batches->second) sampleHistoryBatch(out, batch);
@@ -2092,6 +2137,7 @@ if(terminal){
             std::vector<bool> privateByteHistories_;
             std::vector<StateId> historyAliases_;
             uint64_t sharedHistoryCount_ = 0, sharedHistoryTasks_ = 0;
+            std::set<uint32_t> sharedHistoryTaskIds_;
             uint64_t directCommitCount_ = 0;
             std::map<uint32_t, std::vector<HistoryBatch>> historyBatches_;
             uint64_t historyCandidates_ = 0, historyPrivateRejected_ = 0, historyLayoutRejected_ = 0;

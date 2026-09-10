@@ -567,6 +567,18 @@ schedule 本身不变，发射器重定向私有存储访问并省略冗余 stag
 保持不变。重复 init 只向代表写入相同常量，不改变随机数序列。诊断
 `history_shared_states/tasks` 给出省略的状态数和受影响 task 数。
 
+For tasks with shared private histories, repeated edge predicates are evaluated
+once into task-local `const bool cpu_edge_snapshot_N` values before payload
+writes. The key is the ordered list of `(event ValueId, resolved history StateId,
+edge polarity)`. For example, two writes using `!h0 && clk` reuse one snapshot;
+a write using `!h2 && clk` or `h0 && !clk` retains a distinct predicate. Singleton
+predicates remain inline. All commit operands retain pre-commit boundary values,
+and private histories change only at publication, so the snapshot stays valid
+through intervening payload writes. It is recomputed on every task invocation.
+Write order, unconditional history sampling, stable-history and inactive-edge
+exits, and publication remain unchanged. Observed, signed, random-initialized,
+or otherwise ineligible tasks retain the existing path.
+
 CPU emitter 可以在同一边沿事件域的 commit 函数内部批量暂存私有 event history，
 包括因其他 history 冲突而使用 `AlwaysScanCommit` 的边沿域。
 资格为：history 仅有一个 object ref、state/event 类型相同且均为一个字节的 2-state

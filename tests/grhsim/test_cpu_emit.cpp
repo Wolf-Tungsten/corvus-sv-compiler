@@ -900,6 +900,7 @@ namespace
             require((source.find(marker) != std::string::npos) == scanned, "history scan eligibility/range count differs");
             if (!scanned) require(source.find("cpu_history_edge_scan") == std::string::npos, "unprofitable history scan was emitted");
             require(source.find("cpu_stable_history_skip") == std::string::npos, "observed history used whole-task skip");
+            require(source.find("cpu_edge_snapshot") == std::string::npos, "observed history used an edge snapshot");
             if (test.count != 32) continue;
             const auto makefile = std::filesystem::path(WOLVRIX_GRHSIM_TEST_DATA_DIR) / "cpu_history_scan.mk";
             command("make --no-print-directory -C " + quote(path.string()) + " -f " + quote(makefile.string()) +
@@ -946,6 +947,18 @@ namespace
             for (const auto &message : diagnostics.messages())
                 sharing |= message.message.find("history_shared_states=" + std::to_string(shared) + " ") != std::string::npos;
             require(sharing, "history sharing merged distinct initializers or missed equivalent private histories");
+            require((source.find("const bool cpu_edge_snapshot_0=") != std::string::npos) == !test.signedHistory,
+                    "edge snapshot eligibility differs");
+            if (!test.signedHistory)
+            {
+                require(source.find("// cpu_edge_snapshot uses=" + std::to_string(test.count - 2) + "\n") != std::string::npos,
+                        "edge snapshot merged distinct initial histories or missed repeated guards");
+                require(source.find("const bool cpu_edge_snapshot_1=") == std::string::npos,
+                        "edge snapshot cached a non-repeated predicate");
+                require(source.find("if((cpu_edge_snapshot_0) &&") != std::string::npos ||
+                        source.find("if(cpu_edge_snapshot_0){") != std::string::npos,
+                        "commit payload did not consume the edge snapshot");
+            }
             if (test.count != 32) continue;
             const auto makefile = std::filesystem::path(WOLVRIX_GRHSIM_TEST_DATA_DIR) / "cpu_history_scan.mk";
             command("make --no-print-directory -C " + quote(path.string()) + " -f " + quote(makefile.string()) +
