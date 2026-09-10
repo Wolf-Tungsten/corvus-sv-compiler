@@ -436,6 +436,17 @@ rhsWidth, signedMode)`：两个 pointer 指向低字在前的 uint64_t 数据，
 
 ### CPU C++ 宽状态写入
 
+两态、1–64 位的 staged 标量写入先读取有效值：dirty 时使用当前 shadow，否则使用
+轮初 visible state。完整赋值和 masked 写入都先规范化到目标位宽；masked 写入基于有效值
+合并。新值与有效值相同时不登记 pending，也不写 shadow。第一次变化才登记 state、offset、
+size、fanout 范围和 projection 标记，并直接写入调用方持有的 shadow，不复制已被完整覆盖的旧值。
+后续变化复用同一 pending 条目，visible state 仍只在 publish 边界更新。
+
+例如 visible=0，同轮依次写 1、0，第二次必须与 shadow=1 比较并写回 0；不能因新值等于
+visible 就忽略第二次写入。已有 pending 条目保留到 publish，由最终值比较决定是否激活读者。
+事件 history 仍在原采样位置更新，不受 data enable 或是否触发写边沿影响。批量 history、
+memory cell、宽值和已证明可 direct-commit 的写口继续使用各自的路径。
+
 宽寄存器、锁存器和内存 cell 的 mask 写入复用 legacy 原地 helper，目标指向 staged state。
 每个 word 计算 `(staged & ~mask) | (data & mask)`，保留先前 disjoint-mask 写口在同轮的修改。
 例如 129 位状态的两次写入分别选中 bits 0-63 与 64-128 时，publish 后同时包含两次更新，

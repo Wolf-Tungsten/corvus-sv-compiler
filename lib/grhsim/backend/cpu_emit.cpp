@@ -202,7 +202,7 @@ namespace wolvrix::lib::grhsim
                     class_, "init", "eval", "set_runtime_profile_enabled", "dump_runtime_profile", "cpu_at",
                     "cpu_objects", "cpu_shadow", "cpu_boundary", "cpu_inputs", "cpu_strings", "cpu_bind_strings",
                     "cpu_rng", "cpu_flags", "cpu_next_arms", "cpu_dirty", "Pending", "Target", "cpu_targets",
-                    "cpu_pending", "cpu_stage", "cpu_stage_bytes", "cpu_publish", "cpu_direct_again", "cpu_direct_state_changed",
+                    "cpu_pending", "cpu_stage", "cpu_write_scalar", "cpu_stage_bytes", "cpu_publish", "cpu_direct_again", "cpu_direct_state_changed",
                     "cpu_bitwise_words_changed", "cpu_arithmetic_words_changed", "cpu_shift_words_changed", "cpu_active_word",
                     "cpu_stage_cell", "cpu_memory_readers", "cpu_read_offsets"};
                 if (hasSystemTasks_)
@@ -1331,13 +1331,20 @@ namespace wolvrix::lib::grhsim
                 else out << value(result) << '=' << expr << ";\n";
             }
 
+            bool isScalarLogic(const Type &type) const
+            {
+                return type.kind == TypeKind::Logic && type.domain == LogicDomain::TwoState &&
+                    type.width > 0 && type.width <= 64;
+            }
+
             void stage(std::ostream &out, StateId target, std::string expression) const
             {
                 if (batchedHistories_[target.index]) return;
                 const auto range = stateRanges_[target.index]; const auto &type = stateType(target);
-                out << "cpu_stage<" << cppType(type) << ">(" << target.index << ',' << object(ObjectRef::state(target)).offset
+                const bool scalar = isScalarLogic(type);
+                out << (scalar ? "cpu_write_scalar<" : "cpu_stage<") << cppType(type) << ">(" << target.index << ',' << object(ObjectRef::state(target)).offset
                     << ',' << range.offset << ',' << range.count << ',' << (projected_[target.index] ? "true" : "false")
-                    << ")=" << normalize(std::move(expression), type) << ";\n";
+                    << (scalar ? "," : ")=") << normalize(std::move(expression), type) << (scalar ? ");\n" : ";\n");
             }
 
             std::string stageCell(StateId target, const std::string &row) const
@@ -1461,6 +1468,16 @@ namespace wolvrix::lib::grhsim
                         out << "cpu_direct_state_changed(" << range.offset << ',' << range.count << ','
                             << (projected_[target.index] ? "true" : "false") << ");\n";
                     out << "}}\n";
+                }
+                else if (isScalarLogic(stateType(target)))
+                {
+                    // Merge against the latest shadow so repeated writes retain program order.
+                    out << "const auto cpu_next=" << at(stateType(target),
+                        "(cpu_dirty[" + std::to_string(target.index) + "]?cpu_shadow.get():cpu_objects.get())",
+                        object(refs[0]).offset) << ";\n";
+                    stage(out, target, "(static_cast<std::uint64_t>(cpu_next)&~static_cast<std::uint64_t>(" + value(operands[2]) +
+                        "))|(static_cast<std::uint64_t>(" + value(operands[1]) + ")&static_cast<std::uint64_t>(" + value(operands[2]) + "))");
+                    out << "}\n";
                 }
                 else
                 {
@@ -1602,6 +1619,10 @@ inline bool cpu_shift_words_changed(const std::uint64_t *value, std::size_t valu
                     << "template<class T> T &cpu_stage(std::uint32_t state,std::size_t offset,std::uint32_t begin,std::uint32_t count,bool projection){\n"
                     << "if(!cpu_dirty[state]){cpu_dirty[state]=1;std::memcpy(cpu_shadow.get()+offset,cpu_objects.get()+offset,sizeof(T));cpu_pending.push_back({state,offset,sizeof(T),begin,count,projection});}\n"
                     << "return cpu_at<T>(cpu_shadow.get(),offset);}\n"
+                    << "template<class T> void cpu_write_scalar(std::uint32_t state,std::size_t offset,std::uint32_t begin,std::uint32_t count,bool projection,T next){\n"
+                    << "const T current=cpu_at<T>(cpu_dirty[state]?cpu_shadow.get():cpu_objects.get(),offset);if(current==next)return;\n"
+                    << "if(!cpu_dirty[state]){cpu_pending.push_back({state,offset,sizeof(T),begin,count,projection});cpu_dirty[state]=1;}\n"
+                    << "cpu_at<T>(cpu_shadow.get(),offset)=next;}\n"
                     << "std::byte *cpu_stage_bytes(std::uint32_t state,std::size_t offset,std::size_t size,std::uint32_t begin,std::uint32_t count,bool projection){\n"
                     << "if(!cpu_dirty[state]){cpu_dirty[state]=1;std::memcpy(cpu_shadow.get()+offset,cpu_objects.get()+offset,size);cpu_pending.push_back({state,offset,size,begin,count,projection});}\n"
                     << "return cpu_shadow.get()+offset;}\nbool cpu_publish();\n";

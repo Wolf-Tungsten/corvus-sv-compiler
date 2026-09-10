@@ -1087,6 +1087,81 @@ namespace
                 " CXXFLAGS='-std=c++20 -O0 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
     }
 
+    void testScalarStaging(const std::filesystem::path &directory)
+    {
+        GrhSimModel model("cpu_scalar_stage"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto input = [&](const std::string &name, TypeId type) {
+            const auto id = model.addInput(name, type); const auto value = model.addValue(type);
+            const std::array results{value}; const std::array refs{ObjectRef::input(id)};
+            model.addOperation("core.input.read", {}, results, refs); return value;
+        };
+        const auto state = [&](TypeId type) {
+            const auto id = model.addState("s" + std::to_string(model.states().size()), type);
+            const std::array params{Parameter{model.intern("value"), std::string("0")}};
+            const std::array steps{InitStep{model.intern("core.init.const"), {0, 1}}}; model.addInit(id, steps, params); return id;
+        };
+        const auto output = [&](const std::string &name, StateId id, TypeId type) {
+            const auto value = model.addValue(type); const std::array results{value};
+            const std::array refs{ObjectRef::state(id)};
+            model.addOperation("core.state.read", {}, results, refs);
+            const auto port = model.addOutput(name, type); const std::array ports{ObjectRef::output(port)};
+            model.addOperation("core.output.write", results, {}, ports);
+        };
+        const auto clock = input("clock", bit), enable = input("enable", bit);
+        const std::array<std::pair<unsigned, bool>, 10> cases{{
+            {1, false}, {5, false}, {5, true}, {8, false}, {13, false},
+            {13, true}, {32, false}, {32, true}, {64, false}, {64, true}}};
+        std::vector<StateId> registers;
+        for (std::size_t i = 0; i < cases.size(); ++i)
+        {
+            const auto [width, isSigned] = cases[i];
+            const auto type = model.logicType(width, isSigned, LogicDomain::TwoState);
+            const auto reg = state(type); registers.push_back(reg);
+            output("q" + std::to_string(i), reg, type);
+            for (unsigned writer = 0; writer < 2; ++writer)
+            {
+                const auto suffix = std::to_string(i) + "_" + std::to_string(writer);
+                const auto data = input("data" + suffix, type), mask = input("mask" + suffix, type);
+                const auto history = state(bit);
+                if (writer == 0) output("history" + std::to_string(i), history, bit);
+                const std::array operands{enable, data, mask, clock};
+                const std::array refs{ObjectRef::state(reg), ObjectRef::state(history)};
+                const std::array params{Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
+                model.addOperation("core.state.regWrite", operands, {}, refs, params);
+            }
+        }
+        map(model);
+        diag::Diagnostics diagnostics;
+        require(emitCpuCpp(model, directory, diagnostics).success, "scalar staging emit failed");
+        require(emittedDirectStates(directory).empty(), "multiwriter scalar fixture bypassed shadow staging");
+        // Expose internals only in this test artifact, before compiling every translation unit.
+        const auto headerPath = directory / "grhsim_cpu_scalar_stage.hpp";
+        std::ifstream headerInput(headerPath);
+        std::string header{std::istreambuf_iterator<char>(headerInput), std::istreambuf_iterator<char>()};
+        headerInput.close();
+        const auto privatePos = header.find("private:\n");
+        require(privatePos != std::string::npos, "scalar staging header has no private section");
+        header.replace(privatePos, std::string("private:").size(), "public:");
+        std::ofstream(headerPath) << header;
+        std::ofstream slots(directory / "scalar_stage_slots.hpp");
+        slots << "struct ScalarStageSlot{std::uint32_t state;std::size_t offset;};\n"
+              << "inline constexpr ScalarStageSlot scalar_stage_slots[]={\n";
+        for (const auto reg : registers)
+        {
+            bool found = false;
+            for (const auto &entry : model.cpuMapping()->dataLayout->objects)
+                if (entry.object == ObjectRef::state(reg))
+                { slots << '{' << reg.index << ',' << entry.slot.offset << "},\n"; found = true; break; }
+            require(found, "scalar fixture state has no object slot");
+        }
+        slots << "};\n"; slots.close();
+        const auto makefile = std::filesystem::path(WOLVRIX_GRHSIM_TEST_DATA_DIR) / "cpu_scalar_stage.mk";
+        command("make --no-print-directory -C " + quote(directory.string()) + " -f " + quote(makefile.string()) +
+                " -j 2 check CXX=" + quote(WOLVRIX_TEST_CXX) +
+                " CXXFLAGS='-std=c++20 -O0 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
+    }
+
     using InitDescription = std::pair<std::string, std::vector<std::pair<std::string, ParameterValue>>>;
 
     void initializedOutput(GrhSimModel &model, const char *name, TypeId type, ValueId address,
@@ -1398,10 +1473,11 @@ int main(int argc, char **argv)
         testStableHistorySkip(directory / "stable_history");
         testHistoryBatches(directory / "history_batches");
         testPrivateCommits(directory / "private_commits");
+        testScalarStaging(directory / "scalar_staging");
         auto unsupported = fixture(); unsupported.addInput("four_state", unsupported.logicType(4, false, LogicDomain::FourState)); map(unsupported);
         diag::Diagnostics rejected; const auto rejectedPath = directory / "unsupported";
         require(!emitCpuCpp(unsupported, rejectedPath, rejected).success && !std::filesystem::exists(rejectedPath), "unsupported type produced artifacts");
-        for (const char *name : {"cpu_flags", "cpu_task_1", "cpu_init_0", "cpu_at", "init", "cpu_bind_strings", "cpu_direct_again", "cpu_direct_state_changed", "cpu_bitwise_words_changed", "cpu_arithmetic_words_changed", "cpu_shift_words_changed", "cpu_active_word"})
+        for (const char *name : {"cpu_flags", "cpu_task_1", "cpu_init_0", "cpu_at", "init", "cpu_bind_strings", "cpu_direct_again", "cpu_direct_state_changed", "cpu_bitwise_words_changed", "cpu_arithmetic_words_changed", "cpu_shift_words_changed", "cpu_active_word", "cpu_write_scalar"})
         {
             auto collision = fixture(); collision.addInput(name, collision.logicType(1, false, LogicDomain::TwoState)); map(collision);
             diag::Diagnostics invalidName; const auto path = directory / (std::string("reserved_") + name);
