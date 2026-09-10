@@ -790,7 +790,8 @@ namespace
     }
 
     GrhSimModel historyScanFixture(unsigned count, unsigned gapEvery, bool derived, bool observe = true,
-                                  std::string_view writeKind = "core.state.regWrite", bool signedHistory = false)
+                                  std::string_view writeKind = "core.state.regWrite", bool signedHistory = false,
+                                  bool randomHistory = false)
     {
         GrhSimModel model("cpu_history_scan"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState), byte = model.logicType(8, false, LogicDomain::TwoState);
@@ -823,7 +824,14 @@ namespace
         const auto state = [&](TypeId type, bool initial) {
             const auto id = model.addState("s" + std::to_string(model.states().size()), type);
             const std::array params{Parameter{model.intern("value"), std::string(initial ? "1" : "0")}};
-            const auto init = model.types()[type.index - 1].kind == TypeKind::Array ? "core.init.fill" : "core.init.const";
+            const bool random = randomHistory && type == historyType;
+            const auto init = random ? "core.init.random" :
+                model.types()[type.index - 1].kind == TypeKind::Array ? "core.init.fill" : "core.init.const";
+            if (random)
+            {
+                const std::array steps{InitStep{model.intern(init), {0, 0}}};
+                model.addInit(id, steps, {}); return id;
+            }
             const std::array steps{InitStep{model.intern(init), {0, 1}}};
             model.addInit(id, steps, params); return id;
         };
@@ -931,8 +939,13 @@ namespace
             const auto marker = "/* cpu_stable_history_scan histories=" + std::to_string(test.count * 2) + " groups=2 */";
             require((source.find(marker) != std::string::npos) == eligible, "private stable history threshold differs");
             require((source.find("cpu_stable_history_skip") != std::string::npos) == eligible, "private history skip eligibility differs");
-            require((source.find("static constexpr std::size_t cpu_histories[]") != std::string::npos) == (eligible && test.gap),
+            require((source.find("static constexpr std::size_t cpu_histories[]") != std::string::npos) == eligible,
                     "sparse history skip did not use exact offsets");
+            bool sharing = false;
+            const auto shared = test.signedHistory ? 0u : test.count * 2 - 4;
+            for (const auto &message : diagnostics.messages())
+                sharing |= message.message.find("history_shared_states=" + std::to_string(shared) + " ") != std::string::npos;
+            require(sharing, "history sharing merged distinct initializers or missed equivalent private histories");
             if (test.count != 32) continue;
             const auto makefile = std::filesystem::path(WOLVRIX_GRHSIM_TEST_DATA_DIR) / "cpu_history_scan.mk";
             command("make --no-print-directory -C " + quote(path.string()) + " -f " + quote(makefile.string()) +
@@ -940,6 +953,17 @@ namespace
                     " CXXFLAGS='-std=c++20 -O0 -g -DCPU_HISTORY_SCAN_PRIVATE=1 -fsanitize=address,undefined -fno-sanitize-recover=all'" +
                     (test.derived ? " CPU_HISTORY_SCAN_ARGS=--derived" : ""));
         }
+    }
+
+    void testRandomHistorySharingFallback(const std::filesystem::path &directory)
+    {
+        auto model = historyScanFixture(32, 0, false, false, "core.state.regWrite", false, true);
+        map(model); diag::Diagnostics diagnostics;
+        require(emitCpuCpp(model, directory, diagnostics).success, "random history emit failed");
+        bool excluded = false;
+        for (const auto &message : diagnostics.messages())
+            excluded |= message.message.find("history_shared_states=0 history_shared_tasks=0 ") != std::string::npos;
+        require(excluded, "random histories were merged despite independent initialization");
     }
 
     void testHistoryBatches(const std::filesystem::path &directory)
@@ -1471,6 +1495,7 @@ int main(int argc, char **argv)
         testSamplingLimit(directory / "sampling_limit");
         testHistoryScan(directory / "history_scan");
         testStableHistorySkip(directory / "stable_history");
+        testRandomHistorySharingFallback(directory / "random_history");
         testHistoryBatches(directory / "history_batches");
         testPrivateCommits(directory / "private_commits");
         testScalarStaging(directory / "scalar_staging");
@@ -1513,10 +1538,11 @@ int main(int argc, char **argv)
             require(emitCpuCpp(*restored, directory / top, multiclockDiagnostics).success, "multiclock emit failed");
             if (top == "cpu_cdc")
             {
-                bool patternCovered = false;
+                bool sharingCovered = false;
                 for (const auto &message : multiclockDiagnostics.messages())
-                    patternCovered |= message.message.find("history_max_pattern=2") != std::string::npos;
-                require(patternCovered, "CDC fixture did not exercise multi-event history patterns");
+                    sharingCovered |= message.message.find("history_shared_states=0 ") == std::string::npos &&
+                        message.message.find("history_shared_states=") != std::string::npos;
+                require(sharingCovered, "CDC fixture did not exercise shared event histories");
             }
             compileAndCompare(directory / top, top);
         }

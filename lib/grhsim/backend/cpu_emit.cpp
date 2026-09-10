@@ -15,6 +15,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <streambuf>
+#include <tuple>
 
 namespace wolvrix::lib::grhsim
 {
@@ -52,7 +53,8 @@ namespace wolvrix::lib::grhsim
                   wordOffsets_(mapping_.partitionTree.partitions.size() + 1), armOffsets_(wordOffsets_.size()), frameSizes_(wordOffsets_.size()),
                   activeOffsets_(wordOffsets_.size()), activeMasks_(wordOffsets_.size()), stateRanges_(model.states().size() + 1),
                   projected_(stateRanges_.size()), fanout_(model.values().size() + 1), batchedHistories_(stateRanges_.size()),
-                  directCommitStates_(stateRanges_.size()), privateByteHistories_(stateRanges_.size())
+                  directCommitStates_(stateRanges_.size()), privateByteHistories_(stateRanges_.size()),
+                  historyAliases_(stateRanges_.size())
             {
                 for (const auto &frame : layout_.localFrames) frameSizes_[frame.owner.index] = frame.size;
                 for (const auto &op : model_.operations())
@@ -262,6 +264,7 @@ namespace wolvrix::lib::grhsim
                         throw std::runtime_error("CPU array initializer leaves uncovered rows: " + std::string(model_.text(model_.states()[record.state.index - 1].name)));
                 }
                 planDirectCommits();
+                planSharedHistories();
                 planHistoryBatches();
             }
 
@@ -274,6 +277,8 @@ namespace wolvrix::lib::grhsim
                     " history_batches=" + std::to_string(historyBatchCount_) +
                     " history_max_batch=" + std::to_string(historyMaxBatch_) +
                     " history_max_pattern=" + std::to_string(historyMaxPattern_) +
+                    " history_shared_states=" + std::to_string(sharedHistoryCount_) +
+                    " history_shared_tasks=" + std::to_string(sharedHistoryTasks_) +
                     " direct_commit_states=" + std::to_string(directCommitCount_) +
                     " state_read_aliases=" + std::to_string(std::count_if(readAliases_.begin(), readAliases_.end(), [](auto id) { return bool(id); })) +
                     " memory_cell_readers=" + std::to_string(memoryReaders_.size());
@@ -357,6 +362,67 @@ namespace wolvrix::lib::grhsim
                 }
             }
 
+            void planSharedHistories()
+            {
+                std::vector<uint32_t> references(model_.states().size() + 1), initializers(references.size());
+                std::vector<std::string> constants(references.size());
+                for (auto ref : model_.objectRefPool())
+                    if (ref.kind == ObjectKind::State) ++references[ref.index];
+                for (const auto &record : model_.initRecords())
+                {
+                    ++initializers[record.state.index];
+                    const auto &type = stateType(record.state);
+                    if (type.kind != TypeKind::Logic || type.width != 1 || type.isSigned ||
+                        type.domain != LogicDomain::TwoState || model_.steps(record).size() != 1) continue;
+                    const auto &step = model_.steps(record).front();
+                    if (model_.text(step.kind) != "core.init.const") continue;
+                    if (const auto *text = parameter<std::string>(model_, model_.parameters(step), "value"))
+                        constants[record.state.index] = initLiteral(*text, type);
+                }
+                const auto &tree = mapping_.partitionTree;
+                for (const auto &task : schedule_.numaNodes[0].cores[0].tasks)
+                {
+                    if (task.execution != CpuExecution::DomainGatedCommit) continue;
+                    const auto &function = tree.partitions[task.partition.index - 1];
+                    const auto arm = armOffsets_[function.parent.index];
+                    std::map<std::tuple<uint32_t, uint32_t, std::string>, StateId> representatives;
+                    std::vector<std::pair<StateId, StateId>> aliases;
+                    bool eligible = true;
+                    for (auto unit : function.children)
+                        for (auto id : tree.partitions[unit.index - 1].ops)
+                        {
+                            const auto &op = model_.operations()[id.index - 1];
+                            const auto name = model_.text(op.opType);
+                            if (name != "core.state.regWrite" && name != "core.state.memWrite" &&
+                                name != "core.state.memFill" && name != "core.state.memWriteSeq")
+                            { eligible = false; continue; }
+                            const auto *edges = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
+                            if (!edges || edges->empty()) { eligible = false; continue; }
+                            const auto events = model_.operands(op).last(edges->size());
+                            const auto histories = model_.objectRefs(op).last(edges->size());
+                            for (std::size_t i = 0; i < edges->size(); ++i)
+                            {
+                                const StateId history{histories[i].index, histories[i].generation};
+                                const auto range = stateRanges_[history.index];
+                                if (references[history.index] != 1 || initializers[history.index] != 1 ||
+                                    constants[history.index].empty() || !projected_[history.index] || range.count != 1 ||
+                                    !stateTargets_[range.offset].arm || stateTargets_[range.offset].offset != arm ||
+                                    ((*edges)[i] != "posedge" && (*edges)[i] != "negedge"))
+                                { eligible = false; continue; }
+                                const auto key = std::make_tuple(events[i].index,
+                                    model_.states()[history.index - 1].type.index, constants[history.index]);
+                                const auto [it, inserted] = representatives.emplace(key, history);
+                                if (!inserted) aliases.emplace_back(history, it->second);
+                            }
+                        }
+                    if (!eligible || aliases.empty()) continue;
+                    // All guards read visible history; every member samples the same snapshot on every task call.
+                    for (auto [history, representative] : aliases) historyAliases_[history.index] = representative;
+                    sharedHistoryCount_ += aliases.size();
+                    ++sharedHistoryTasks_;
+                }
+            }
+
             struct HistoryBatch
             {
                 StateId first;
@@ -397,6 +463,7 @@ namespace wolvrix::lib::grhsim
                                 const auto range = stateRanges_[history.index];
                                 privateByteHistories_[history.index] = type.kind == TypeKind::Logic && type.width == 1 &&
                                     !type.isSigned && type.domain == LogicDomain::TwoState && layout_.types[slot.type.index - 1].size == 1;
+                                if (historyAliases_[history.index]) continue;
                                 if (type.kind != TypeKind::Logic || type.width != 1 || type.domain != LogicDomain::TwoState ||
                                     model_.states()[history.index - 1].type != model_.values()[events[i].index - 1].type ||
                                     layout_.types[slot.type.index - 1].size != 1 || !projected_[history.index] || range.count != 1 ||
@@ -516,6 +583,8 @@ namespace wolvrix::lib::grhsim
             }
             const CpuDataSlot &object(ObjectRef ref) const
             {
+                if (ref.kind == ObjectKind::State && historyAliases_[ref.index])
+                    ref = ObjectRef::state(historyAliases_[ref.index]);
                 const auto index = ref.kind == ObjectKind::Input ? ref.index - 1 : ref.kind == ObjectKind::Output ?
                     model_.inputs().size() + ref.index - 1 : model_.inputs().size() + model_.outputs().size() + ref.index - 1;
                 return layout_.objects[index].slot;
@@ -1341,7 +1410,7 @@ namespace wolvrix::lib::grhsim
 
             void stage(std::ostream &out, StateId target, std::string expression) const
             {
-                if (batchedHistories_[target.index]) return;
+                if (batchedHistories_[target.index] || historyAliases_[target.index]) return;
                 const auto range = stateRanges_[target.index]; const auto &type = stateType(target);
                 const bool scalar = isScalarLogic(type);
                 out << (scalar ? "cpu_write_scalar<" : "cpu_stage<") << cppType(type) << ">(" << target.index << ',' << object(ObjectRef::state(target)).offset
@@ -1829,6 +1898,7 @@ if(terminal){
                 {
                     auto &offsets = group.offsets;
                     std::sort(offsets.begin(), offsets.end());
+                    offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
                     // Every byte is a distinct private history; no task can have staged it earlier.
                     if (offsets.back() - offsets.front() + 1 == offsets.size())
                         out << "if(std::memchr(cpu_objects.get()+" << offsets.front() << ",!bool(" << value(group.value) << "),"
@@ -2020,6 +2090,8 @@ if(terminal){
             std::vector<bool> batchedHistories_;
             std::vector<bool> directCommitStates_;
             std::vector<bool> privateByteHistories_;
+            std::vector<StateId> historyAliases_;
+            uint64_t sharedHistoryCount_ = 0, sharedHistoryTasks_ = 0;
             uint64_t directCommitCount_ = 0;
             std::map<uint32_t, std::vector<HistoryBatch>> historyBatches_;
             uint64_t historyCandidates_ = 0, historyPrivateRejected_ = 0, historyLayoutRejected_ = 0;

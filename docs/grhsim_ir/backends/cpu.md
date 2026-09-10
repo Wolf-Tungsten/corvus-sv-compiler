@@ -552,6 +552,21 @@ bit1 留在全局等待后续扫描。域 arm、DPI guard/history 和 commit 发
 
 ### CPU C++ 多时钟回归
 
+发射器先尝试在同一个 `DomainGatedCommit` task 内共享等价的私有事件历史。
+整个 task 必须只含 `regWrite/memWrite/memFill/memWriteSeq`，所有事件为
+posedge/negedge；每个 history 只有一个 object ref、unsigned two-state 1-bit 类型、
+唯一常量初始化记录，且 publication 目标恰为本域 arm。任一条件不满足则整个 task
+保留原历史布局。随机初始化、被观察或额外写入的历史、不同 task 均不共享。
+
+共享键为 `(event ValueId, history TypeId, 规范化初始常量)`。例如同一 task 的三个
+posedge 操作引用历史 `[h0=0,h1=0,h2=1]` 且采样同一 `clk`，发射后前两个守卫
+读取 h0，第三个仍读取 h2；只暂存 h0 和 h2。每次 task 执行均无条件采样历史，
+因此相同初值的成员在所有 publication 边界保持相等。guard 始终读取 visible 值，
+代表的 shadow 更新不会提前暴露；代表沿用原域唤醒目标。IR state、layout 元数据和
+schedule 本身不变，发射器重定向私有存储访问并省略冗余 stage；原存储 arena 大小
+保持不变。重复 init 只向代表写入相同常量，不改变随机数序列。诊断
+`history_shared_states/tasks` 给出省略的状态数和受影响 task 数。
+
 CPU emitter 可以在同一边沿事件域的 commit 函数内部批量暂存私有 event history，
 包括因其他 history 冲突而使用 `AlwaysScanCommit` 的边沿域。
 资格为：history 仅有一个 object ref、state/event 类型相同且均为一个字节的 2-state
@@ -576,7 +591,8 @@ edge guard 必为假，函数只按原 op/event 顺序采样 history，并执行
 旧值 0 时可能触发，negedge 项仅在当前值为假且有旧值 1 时可能触发。单段直接
 `std::memchr`，多段使用 constexpr offset/size 表及短路循环，不分配或复制 history。
 稀疏/小组保留原电平必要条件。这个 OR 只决定是否走上述 sampling-only 分支，各
-history 的初值和完整 guard 仍独立；不能用一个代表 history 或 pending shadow 替代。
+history 的初值和完整 guard 仍独立；只有上述已证明等价的历史才能使用代表，
+不能读取 pending shadow。
 回归覆盖尾字节命中、混合边沿、不同初值、派生时钟、区间间隙、固定电平下数据变化
 和重复 init，并保留 shared-history 的 AlwaysScanCommit 测试。
 
@@ -588,7 +604,8 @@ history 的初值和完整 guard 仍独立；不能用一个代表 history 或 p
 
 条件为每个 history 的 visible 值等于其当前事件值。成立时全部边沿守卫为假，且历史
 采样也不改变值；私有性排除了需要覆盖的其他 pending 写者，因此可直接返回而不暂存。
-任一 history 不同就完整保留原 guard/采样路径，不能据此冻结 history 或只检查一个代表值。
+任一 history 不同就完整保留原 guard/采样路径，不能据此冻结 history 或合并不同初值。
+已证明等价的共享历史按代表 offset 去重，避免重复扫描同一个值。
 按当前 ValueId 分组，连续历史字节以 memchr 查找相反布尔值，非连续历史以 constexpr
 offset 表逐字节比较，不扫描间隙、不创建副本，不改变 E、domain arm 或 fixed-point 规则。
 
