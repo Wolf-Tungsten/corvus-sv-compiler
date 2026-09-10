@@ -266,6 +266,7 @@ namespace wolvrix::lib::grhsim
                 planDirectCommits();
                 planSharedHistories();
                 planComputeSharedHistories();
+                planComputeEdgeGuards();
                 planHistoryBatches();
             }
 
@@ -282,6 +283,8 @@ namespace wolvrix::lib::grhsim
                     " history_shared_tasks=" + std::to_string(sharedHistoryTasks_) +
                     " compute_history_aliases=" + std::to_string(computeSharedHistoryCount_) +
                     " compute_history_alias_units=" + std::to_string(computeSharedHistoryUnits_) +
+                    " compute_guard_snapshots=" + std::to_string(computeGuardSnapshots_) +
+                    " compute_guard_snapshot_uses=" + std::to_string(computeGuardUses_) +
                     " direct_commit_states=" + std::to_string(directCommitCount_) +
                     " state_read_aliases=" + std::to_string(std::count_if(readAliases_.begin(), readAliases_.end(), [](auto id) { return bool(id); })) +
                     " memory_cell_readers=" + std::to_string(memoryReaders_.size());
@@ -511,6 +514,87 @@ namespace wolvrix::lib::grhsim
                 std::size_t count = 0;
                 std::vector<ValueId> pattern;
             };
+
+            struct ComputeGuardGroup
+            {
+                OpId first{};
+                std::size_t historyBase = 0;
+                std::string name;
+                std::vector<OpId> ops;
+            };
+
+            void planComputeEdgeGuards()
+            {
+                const auto &tree = mapping_.partitionTree;
+                std::size_t names = 0;
+                for (const auto &task : schedule_.numaNodes[0].cores[0].tasks)
+                {
+                    if (task.execution != CpuExecution::ActivityDrivenCompute) continue;
+                    for (auto word : tree.partitions[task.partition.index - 1].children)
+                    for (auto unit : tree.partitions[word.index - 1].children)
+                    {
+                        const auto &partition = tree.partitions[unit.index - 1];
+                        std::vector<OpId> ops;
+                        for (auto node : partition.children)
+                            ops.insert(ops.end(), tree.partitions[node.index - 1].ops.begin(), tree.partitions[node.index - 1].ops.end());
+                        std::set<uint32_t> produced;
+                        bool bail = false;
+                        for (auto id : ops)
+                        {
+                            const auto &op = model_.operations()[id.index - 1];
+                            const auto name = model_.text(op.opType);
+                            // Visible state must stay invariant during the whole unit invocation.
+                            if (name == "core.output.write" || (name == "core.dpi.call" && !model_.results(op).empty()))
+                            { bail = true; break; }
+                            for (auto result : model_.results(op)) produced.insert(result.index);
+                        }
+                        if (bail) continue;
+                        using Key = std::vector<std::tuple<uint32_t, uint32_t, std::string>>;
+                        std::map<Key, std::vector<OpId>> groups;
+                        for (auto id : ops)
+                        {
+                            const auto &op = model_.operations()[id.index - 1];
+                            const auto name = model_.text(op.opType);
+                            std::size_t historyBase;
+                            if (name == "core.dpi.call") historyBase = 1;
+                            else if (name == "core.system.task") historyBase = 0;
+                            else continue;
+                            const auto *edges = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
+                            if (!edges || edges->empty()) continue;
+                            const auto events = model_.operands(op).last(edges->size());
+                            const auto refs = model_.objectRefs(op);
+                            if (refs.size() < historyBase + edges->size()) continue;
+                            bool stable = true;
+                            Key key;
+                            for (std::size_t i = 0; i < edges->size() && stable; ++i)
+                            {
+                                if (refs[historyBase + i].kind != ObjectKind::State) { stable = false; break; }
+                                const auto event = events[i];
+                                // Only visible-state or boundary reads stay invariant during this unit invocation.
+                                if (produced.contains(event.index) ||
+                                    (!readAliases_[event.index] && layout_.values[event.index - 1].kind != CpuStorageKind::Boundary))
+                                    stable = false;
+                                const auto alias = historyAliases_[refs[historyBase + i].index];
+                                key.emplace_back(event.index, alias ? alias.index : refs[historyBase + i].index, (*edges)[i]);
+                            }
+                            if (!stable) continue;
+                            groups[std::move(key)].push_back(id);
+                        }
+                        for (auto &[key, grouped] : groups)
+                        {
+                            if (grouped.size() < 2) continue;
+                            ComputeGuardGroup group;
+                            group.first = grouped.front();
+                            group.historyBase = model_.text(model_.operations()[grouped.front().index - 1].opType) == "core.dpi.call" ? 1 : 0;
+                            group.name = "cpu_cevent_" + std::to_string(unit.index) + "_" + std::to_string(names++);
+                            group.ops = std::move(grouped);
+                            computeGuardUses_ += group.ops.size();
+                            ++computeGuardSnapshots_;
+                            computeGuardGroups_[unit.index].push_back(std::move(group));
+                        }
+                    }
+                }
+            }
 
             void planHistoryBatches()
             {
@@ -1209,7 +1293,7 @@ namespace wolvrix::lib::grhsim
                 out << "}}\n";
             }
 
-            void dpiCall(std::ostream &out, const SimOp &op, PartitionId activeUnit) const
+            void dpiCall(std::ostream &out, const SimOp &op, PartitionId activeUnit, const std::string &cachedGuard = {}) const
             {
                 const auto &function = model_.functions()[model_.objectRefs(op)[0].index - 1];
                 const auto arguments = model_.arguments(function);
@@ -1223,7 +1307,8 @@ namespace wolvrix::lib::grhsim
                 std::size_t input = 1, inoutInput = 1 + inputCount, output = function.returnType ? 1 : 0;
                 std::size_t inoutOutput = output + outputCount;
                 std::vector<std::pair<ValueId, std::string>> produced;
-                out << "if(" << callCondition(operands[0]) << " && (" << eventGuard(op, 1) << ")){\n";
+                if (cachedGuard.empty()) out << "if(" << callCondition(operands[0]) << " && (" << eventGuard(op, 1) << ")){\n";
+                else out << "if(" << cachedGuard << " && " << callCondition(operands[0]) << "){\n";
                 std::string call = "::" + identifier(model_.text(function.symbol)) + "(";
                 for (std::size_t i = 0; i < arguments.size(); ++i)
                 {
@@ -1275,7 +1360,7 @@ namespace wolvrix::lib::grhsim
                         throw std::runtime_error("CPU system task array arguments are not implemented");
             }
 
-            void systemTask(std::ostream &out, const SimOp &op) const
+            void systemTask(std::ostream &out, const SimOp &op, const std::string &cachedGuard = {}) const
             {
                 const auto params = model_.parameters(op);
                 const auto &name = *parameter<std::string>(model_, params, "name");
@@ -1283,7 +1368,8 @@ namespace wolvrix::lib::grhsim
                 const auto *timed = parameter<bool>(model_, params, "has_timing");
                 const auto *edges = parameter<std::vector<std::string>>(model_, params, "event_edges");
                 const auto operands = model_.operands(op);
-                out << "if(" << callCondition(operands[0]) << " && (" << eventGuard(op, 0) << ")";
+                if (cachedGuard.empty()) out << "if(" << callCondition(operands[0]) << " && (" << eventGuard(op, 0) << ")";
+                else out << "if(" << cachedGuard << " && " << callCondition(operands[0]);
                 if (proc && *proc == "initial" && (!timed || !*timed)) out << " && cpu_first_eval";
                 const auto once = onceTasks_.find(op.id.index);
                 if (once != onceTasks_.end()) out << " && !cpu_system_done[" << once->second << ']';
@@ -1304,7 +1390,8 @@ namespace wolvrix::lib::grhsim
                 sampleEvents(out, op, 0);
             }
 
-            void computeGroup(std::ostream &out, std::span<const OpId> ops, PartitionId unit) const
+            void computeGroup(std::ostream &out, std::span<const OpId> ops, PartitionId unit,
+                              const std::map<uint32_t, std::string> &guards = {}) const
             {
                 std::map<std::vector<uint32_t>, std::size_t> indices;
                 std::vector<const CpuActivationTargets *> groups;
@@ -1331,18 +1418,21 @@ namespace wolvrix::lib::grhsim
                     const auto &op = model_.operations()[id.index - 1];
                     const auto results = model_.results(op);
                     const auto found = results.size() == 1 ? groupByValue.find(results[0].index) : groupByValue.end();
-                    compute(out, op, unit, found == groupByValue.end() ? std::string{} : "cpu_changed_" + std::to_string(found->second));
+                    const auto guard = guards.find(id.index);
+                    compute(out, op, unit, found == groupByValue.end() ? std::string{} : "cpu_changed_" + std::to_string(found->second),
+                        guard == guards.end() ? std::string{} : guard->second);
                 }
                 for (std::size_t i = 0; i < groups.size(); ++i)
                     activate(out, *groups[i], false, unit, "cpu_changed_" + std::to_string(i));
             }
 
-            void compute(std::ostream &out, const SimOp &op, PartitionId activeUnit, const std::string &changed = {}) const
+            void compute(std::ostream &out, const SimOp &op, PartitionId activeUnit, const std::string &changed = {},
+                         const std::string &cachedGuard = {}) const
             {
                 if (model_.text(op.opType) == "core.system.task")
-                { systemTask(out, op); return; }
+                { systemTask(out, op, cachedGuard); return; }
                 if (model_.text(op.opType) == "core.dpi.call")
-                { dpiCall(out, op, activeUnit); return; }
+                { dpiCall(out, op, activeUnit, cachedGuard); return; }
                 if (model_.text(op.opType) == "core.output.write")
                 {
                     const auto operand = model_.operands(op)[0]; const auto ref = model_.objectRefs(op)[0];
@@ -1790,8 +1880,21 @@ inline bool cpu_shift_words_changed(const std::uint64_t *value, std::size_t valu
                 for (std::size_t i = 0; i < initChunkCount(); ++i) out << "void cpu_init_" << i << "();\n";
                 for (const auto &task : schedule_.numaNodes[0].cores[0].tasks) out << "void cpu_task_" << task.id.index << "();\n";
                 for (const auto &partition : mapping_.partitionTree.partitions)
+                {
+                    if (partition.attrs.helperChunks.empty()) continue;
+                    std::vector<OpId> ops;
+                    for (auto node : partition.children)
+                        ops.insert(ops.end(), mapping_.partitionTree.partitions[node.index - 1].ops.begin(),
+                            mapping_.partitionTree.partitions[node.index - 1].ops.end());
                     for (std::size_t i = 0; i < partition.attrs.helperChunks.size(); ++i)
-                        out << "void cpu_helper_" << partition.id.index << '_' << i << "(std::byte *cpu_local,std::uint8_t &cpu_active_word);\n";
+                    {
+                        const auto range = partition.attrs.helperChunks[i];
+                        out << "void cpu_helper_" << partition.id.index << '_' << i << "(std::byte *cpu_local,std::uint8_t &cpu_active_word";
+                        for (const auto &param : computeGuardParams(partition.id, std::span<const OpId>(ops).subspan(range.offset, range.count)))
+                            out << ",bool " << param;
+                        out << ");\n";
+                    }
+                }
                 out << "};\n";
             }
 
@@ -2106,6 +2209,39 @@ if(terminal){
                 return guards;
             }
 
+            std::map<uint32_t, std::string> computeGuardMap(PartitionId unit) const
+            {
+                std::map<uint32_t, std::string> guards;
+                const auto found = computeGuardGroups_.find(unit.index);
+                if (found == computeGuardGroups_.end()) return guards;
+                for (const auto &group : found->second)
+                    for (auto id : group.ops) guards.emplace(id.index, group.name);
+                return guards;
+            }
+
+            void emitComputeGuardLocals(std::ostream &out, PartitionId unit) const
+            {
+                const auto found = computeGuardGroups_.find(unit.index);
+                if (found == computeGuardGroups_.end()) return;
+                for (const auto &group : found->second)
+                    // Visible histories and boundary events cannot change during this unit invocation.
+                    out << "const bool " << group.name << "=("
+                        << eventGuard(model_.operations()[group.first.index - 1], group.historyBase)
+                        << "); // cpu_cevent uses=" << group.ops.size() << '\n';
+            }
+
+            std::vector<std::string> computeGuardParams(PartitionId unit, std::span<const OpId> chunk) const
+            {
+                std::vector<std::string> params;
+                const auto found = computeGuardGroups_.find(unit.index);
+                if (found == computeGuardGroups_.end()) return params;
+                for (const auto &group : found->second)
+                    for (auto id : chunk)
+                        if (std::find(group.ops.begin(), group.ops.end(), id) != group.ops.end())
+                        { params.push_back(group.name); break; }
+                return params;
+            }
+
             void taskBody(std::ostream &out, const CpuScheduledTask &task) const
             {
                 out << "#include \"" << prefix_ << ".hpp\"\n";
@@ -2154,14 +2290,28 @@ if(terminal){
                                 out << "std::string cpu_string_" << stringOffset << ";cpu_at<std::string*>(cpu_local,"
                                     << stringOffset << ")=&cpu_string_" << stringOffset << ";\n";
                             if (!partition.attrs.helperChunks.empty())
+                            {
+                                std::vector<OpId> ops;
+                                for (auto node : partition.children)
+                                    ops.insert(ops.end(), tree.partitions[node.index - 1].ops.begin(), tree.partitions[node.index - 1].ops.end());
+                                emitComputeGuardLocals(out, unit);
                                 for (std::size_t i = 0; i < partition.attrs.helperChunks.size(); ++i)
-                                    out << "cpu_helper_" << unit.index << '_' << i << "(cpu_local,cpu_active_word);\n";
+                                {
+                                    const auto range = partition.attrs.helperChunks[i];
+                                    out << "cpu_helper_" << unit.index << '_' << i << "(cpu_local,cpu_active_word";
+                                    for (const auto &param : computeGuardParams(unit, std::span<const OpId>(ops).subspan(range.offset, range.count)))
+                                        out << ',' << param;
+                                    out << ");\n";
+                                }
+                            }
                             else
                             {
                                 std::vector<OpId> ops;
                                 for (auto node : partition.children)
                                     ops.insert(ops.end(), tree.partitions[node.index - 1].ops.begin(), tree.partitions[node.index - 1].ops.end());
-                                computeGroup(out, ops, unit);
+                                emitComputeGuardLocals(out, unit);
+                                const auto guards = computeGuardMap(unit);
+                                computeGroup(out, ops, unit, guards);
                             }
                             out << "}\n";
                         }
@@ -2178,9 +2328,13 @@ if(terminal){
                             for (auto node : partition.children) ops.insert(ops.end(), tree.partitions[node.index - 1].ops.begin(), tree.partitions[node.index - 1].ops.end());
                             for (std::size_t i = 0; i < partition.attrs.helperChunks.size(); ++i)
                             {
-                                out << "void " << class_ << "::cpu_helper_" << unit.index << '_' << i << "(std::byte *cpu_local,std::uint8_t &cpu_active_word){\n";
                                 const auto range = partition.attrs.helperChunks[i];
-                                computeGroup(out, std::span<const OpId>(ops).subspan(range.offset, range.count), unit);
+                                const auto chunk = std::span<const OpId>(ops).subspan(range.offset, range.count);
+                                out << "void " << class_ << "::cpu_helper_" << unit.index << '_' << i << "(std::byte *cpu_local,std::uint8_t &cpu_active_word";
+                                for (const auto &param : computeGuardParams(unit, chunk)) out << ",bool " << param;
+                                out << "){\n";
+                                const auto guards = computeGuardMap(unit);
+                                computeGroup(out, chunk, unit, guards);
                                 out << "}\n";
                             }
                         }
@@ -2219,6 +2373,8 @@ if(terminal){
             uint64_t sharedHistoryCount_ = 0, sharedHistoryTasks_ = 0;
             std::set<uint32_t> sharedHistoryTaskIds_;
             uint64_t computeSharedHistoryCount_ = 0, computeSharedHistoryUnits_ = 0;
+            uint64_t computeGuardSnapshots_ = 0, computeGuardUses_ = 0;
+            std::map<std::uint32_t, std::vector<ComputeGuardGroup>> computeGuardGroups_;
             uint64_t directCommitCount_ = 0;
             std::map<uint32_t, std::vector<HistoryBatch>> historyBatches_;
             uint64_t historyCandidates_ = 0, historyPrivateRejected_ = 0, historyLayoutRejected_ = 0;

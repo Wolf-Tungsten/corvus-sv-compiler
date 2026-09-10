@@ -1032,6 +1032,14 @@ namespace
         require(count("cpu_write_scalar<bool>(") == 7, "compute history samples were not collapsed to unit representatives");
         require(count("cpu_write_scalar<bool>(" + std::to_string(observed.index) + ",") == 2,
                 "history referenced by two calls lost an unconditional sample");
+        // Every unit holds a same-key call pair, so each pair's repeated event guard collapses to one local.
+        bool hoisted = false;
+        for (const auto &message : diagnostics.messages())
+            hoisted |= message.message.find("compute_guard_snapshots=6 compute_guard_snapshot_uses=12 ") != std::string::npos;
+        require(hoisted, "compute guard hoisting missed same-unit repeated event guards");
+        require(count("const bool cpu_cevent_") == 6, "compute guard locals were not emitted once per unit key");
+        require(count("if(cpu_cevent_") == 12, "guarded system tasks did not consume the hoisted event guard");
+        require(count("(false ||") == 6, "repeated event guard expressions were not collapsed");
     }
 
     void testHistoryBatches(const std::filesystem::path &directory)
