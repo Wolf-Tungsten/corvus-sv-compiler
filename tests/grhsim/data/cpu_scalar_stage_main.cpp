@@ -73,6 +73,61 @@ void testLane(GrhSIM_cpu_scalar_stage &model, unsigned lane, unsigned width,
     }
 }
 
+void testPhaseProfile()
+{
+    GrhSIM_cpu_scalar_stage plain, profiled;
+    plain.init(); profiled.init();
+    profiled.set_runtime_profile_enabled(true);
+    std::mt19937 random(83115);
+    for (unsigned sample = 0; sample < 2048; ++sample) {
+        const bool clock = (random() & 1) != 0, enable = (random() & 3) != 0;
+        plain.clock = profiled.clock = clock;
+        plain.enable = profiled.enable = enable;
+        plain.data3_0 = profiled.data3_0 = random();
+        plain.data3_1 = profiled.data3_1 = random();
+        plain.mask3_0 = profiled.mask3_0 = random();
+        plain.mask3_1 = profiled.mask3_1 = random();
+        plain.eval(); profiled.eval();
+#define SAME_LANE(N) require(plain.q##N == profiled.q##N && plain.history##N == profiled.history##N, \
+                            "phase profiling changed model behavior")
+        SAME_LANE(0); SAME_LANE(1); SAME_LANE(2); SAME_LANE(3); SAME_LANE(4);
+        SAME_LANE(5); SAME_LANE(6); SAME_LANE(7); SAME_LANE(8); SAME_LANE(9);
+#undef SAME_LANE
+    }
+    const auto measured = profiled.cpu_runtime_profile();
+    require(measured.evals == 2048 && measured.rounds >= measured.evals,
+            "phase profiling counted evals or convergence rounds incorrectly");
+    require(measured.compute_ns > 0 && measured.commit_ns > 0 && measured.publish_ns > 0,
+            "phase profiling omitted a nonempty phase");
+    require(measured.eval_ns >= measured.compute_ns + measured.commit_ns + measured.publish_ns,
+            "phase profiling overlaps timing intervals");
+    const auto disabled = plain.cpu_runtime_profile();
+    require(disabled.evals == 0 && disabled.rounds == 0 && disabled.eval_ns == 0 &&
+            disabled.compute_ns == 0 && disabled.commit_ns == 0 && disabled.publish_ns == 0,
+            "disabled profiling changed counters");
+    profiled.dump_runtime_profile();
+    profiled.set_runtime_profile_enabled(false);
+    for (unsigned i = 0; i < 16; ++i) { profiled.clock = !profiled.clock; profiled.eval(); }
+    const auto paused = profiled.cpu_runtime_profile();
+    require(paused.evals == measured.evals && paused.rounds == measured.rounds &&
+            paused.eval_ns == measured.eval_ns && paused.compute_ns == measured.compute_ns &&
+            paused.commit_ns == measured.commit_ns && paused.publish_ns == measured.publish_ns,
+            "paused profiling did not preserve counters");
+    profiled.set_runtime_profile_enabled(true);
+    require(profiled.cpu_runtime_profile().evals == 0 && profiled.cpu_runtime_profile().eval_ns == 0,
+            "enabling profiling did not start a fresh measurement");
+    profiled.eval();
+    require(profiled.cpu_runtime_profile().evals == 1, "re-enabled profiling did not record eval");
+    profiled.init();
+    const auto reset = profiled.cpu_runtime_profile();
+    require(reset.evals == 0 && reset.rounds == 0 && reset.eval_ns == 0 &&
+            reset.compute_ns == 0 && reset.commit_ns == 0 && reset.publish_ns == 0,
+            "model init did not clear profiling counters");
+    profiled.eval();
+    require(profiled.cpu_runtime_profile().evals == 1, "model init lost profiling enable state");
+    std::cout << "phase profile PASS replay_evals=2048 pause_evals=16\n";
+}
+
 int main()
 {
     GrhSIM_cpu_scalar_stage model;
@@ -83,4 +138,5 @@ int main()
     CHECK_LANE(8, 64); CHECK_LANE(9, 64);
 #undef CHECK_LANE
     std::cout << "scalar staging PASS lanes=10 edges=10240\n";
+    testPhaseProfile();
 }

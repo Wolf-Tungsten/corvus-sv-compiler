@@ -398,6 +398,29 @@ Schedule stage 要求外层 complete 为 true，其余阶段要求 false；stage
 
 ## 5. 验证
 
+### CPU C++ 阶段计时
+
+模型默认关闭运行时计时。`set_runtime_profile_enabled(true)` 清空计数并启用新一轮测量；
+传入 false 暂停计数但保留数据。`init()` 清空计数并保持启用状态。
+`cpu_runtime_profile()` 返回只读快照引用，`dump_runtime_profile()` 在至少一个 eval 完成后
+向 stderr 输出一行 `[grhsim-cpu-phase]` 数据；XiangShan 的既有 `EMU_RUNTIME_PROFILE=1`
+会调用这些启用/导出接口，不需要修改 workload。
+
+计数项为完成的 `evals` 和进入的收敛 `rounds`。所有时间项使用 steady_clock 纳秒：
+
+- `eval_ns`：成功返回的完整 eval 区间，包括输入同步、round seed、arm 交接和输出复制。
+- `compute_ns`：连续 ActivityDrivenCompute task 段，包含外层 activity guard 和实际调用。
+- `commit_ns`：连续 commit task 段，包含 domain guard 和实际调用。
+- `publish_ns`：每轮 cpu_publish 区间。
+
+段切换只读一次时钟并累加前一段，不改变原调度顺序。相邻时钟读取和记账存在小额扰动，
+阶段时间不是纯 task CPU 时间；三个阶段的和应不大于完整 eval 时间，差值包含未分桶工作。
+失败 eval 可能留下部分 round/阶段计数，此时应丢弃测量并重置模型，不能用于性能结论。
+关闭计时不读时钟，但仍有条件分支和代码布局变化；其性能影响需在相同输入下实测。
+这些诊断计时不能直接作为未插桩仿真提速的证据。
+
+### Backend mapping 校验
+
 `CpuBackendMapping` 必须满足：
 
 - `DataLayout` 完整覆盖当前 `GrhSimModel` 的 I/O/S/value；每个 `cpu_type` 都能解析到 cpu

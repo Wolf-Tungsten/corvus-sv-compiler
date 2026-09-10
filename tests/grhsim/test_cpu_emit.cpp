@@ -1477,7 +1477,7 @@ int main(int argc, char **argv)
         auto unsupported = fixture(); unsupported.addInput("four_state", unsupported.logicType(4, false, LogicDomain::FourState)); map(unsupported);
         diag::Diagnostics rejected; const auto rejectedPath = directory / "unsupported";
         require(!emitCpuCpp(unsupported, rejectedPath, rejected).success && !std::filesystem::exists(rejectedPath), "unsupported type produced artifacts");
-        for (const char *name : {"cpu_flags", "cpu_task_1", "cpu_init_0", "cpu_at", "init", "cpu_bind_strings", "cpu_direct_again", "cpu_direct_state_changed", "cpu_bitwise_words_changed", "cpu_arithmetic_words_changed", "cpu_shift_words_changed", "cpu_active_word", "cpu_write_scalar"})
+        for (const char *name : {"cpu_flags", "cpu_task_1", "cpu_init_0", "cpu_at", "init", "cpu_bind_strings", "cpu_direct_again", "cpu_direct_state_changed", "cpu_bitwise_words_changed", "cpu_arithmetic_words_changed", "cpu_shift_words_changed", "cpu_active_word", "cpu_write_scalar", "CpuRuntimeProfile", "cpu_runtime_profile", "cpu_profile_enabled", "cpu_profile_tick"})
         {
             auto collision = fixture(); collision.addInput(name, collision.logicType(1, false, LogicDomain::TwoState)); map(collision);
             diag::Diagnostics invalidName; const auto path = directory / (std::string("reserved_") + name);

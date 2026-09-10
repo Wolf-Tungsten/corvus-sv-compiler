@@ -204,6 +204,8 @@ namespace wolvrix::lib::grhsim
                     "cpu_rng", "cpu_flags", "cpu_next_arms", "cpu_dirty", "Pending", "Target", "cpu_targets",
                     "cpu_pending", "cpu_stage", "cpu_write_scalar", "cpu_stage_bytes", "cpu_publish", "cpu_direct_again", "cpu_direct_state_changed",
                     "cpu_bitwise_words_changed", "cpu_arithmetic_words_changed", "cpu_shift_words_changed", "cpu_active_word",
+                    "CpuRuntimeProfile", "cpu_runtime_profile", "cpu_profile_enabled", "cpu_profile_data", "cpu_profile",
+                    "cpu_profile_clock", "cpu_profile_eval_begin", "cpu_profile_phase_begin", "cpu_profile_tick",
                     "cpu_stage_cell", "cpu_memory_readers", "cpu_read_offsets"};
                 if (hasSystemTasks_)
                     for (const auto *name : {"cpu_first_eval", "cpu_system_done", "cpu_strobes", "cpu_system_task"}) names.insert(name);
@@ -1595,7 +1597,12 @@ inline bool cpu_shift_words_changed(const std::uint64_t *value, std::size_t valu
                 for (const auto &input : model_.inputs()) out << cppType(model_.types()[input.type.index - 1]) << ' ' << identifier(model_.text(input.name)) << "{};\n";
                 for (const auto &output : model_.outputs()) out << cppType(model_.types()[output.type.index - 1]) << ' ' << identifier(model_.text(output.name)) << "{};\n";
                 out << class_ << "(){cpu_bind_strings();}\n"
-                    << "void init();\nvoid eval();\nvoid set_runtime_profile_enabled(bool enabled){if(enabled) throw std::runtime_error(\"CPU runtime profiling is not implemented\");}\nvoid dump_runtime_profile() const {}\nprivate:\n";
+                    << "struct CpuRuntimeProfile{std::uint64_t evals=0,rounds=0,eval_ns=0,compute_ns=0,commit_ns=0,publish_ns=0;};\n"
+                    << "void init();\nvoid eval();\n"
+                    << "void set_runtime_profile_enabled(bool enabled){cpu_profile_enabled=enabled;if(enabled)cpu_profile_data={};}\n"
+                    << "const CpuRuntimeProfile &cpu_runtime_profile() const{return cpu_profile_data;}\n"
+                    << "void dump_runtime_profile() const;\nprivate:\n"
+                    << "bool cpu_profile_enabled=false;CpuRuntimeProfile cpu_profile_data{};\n";
                 if (hasSystemTasks_)
                     out << "bool cpu_first_eval=true;std::array<bool," << onceTasks_.size() << "> cpu_system_done{};\n"
                         << "std::vector<std::string> cpu_strobes;\nvoid cpu_system_task(std::string_view,std::span<const grhsim_task_arg>);\n";
@@ -1662,7 +1669,7 @@ inline bool cpu_shift_words_changed(const std::uint64_t *value, std::size_t valu
 
             void driver(std::ostream &out) const
             {
-                out << "#include \"" << prefix_ << ".hpp\"\nconst std::array<" << class_ << "::Target," << stateTargets_.size() << "> " << class_ << "::cpu_targets{{\n";
+                out << "#include \"" << prefix_ << ".hpp\"\n#include <chrono>\n#include <cstdio>\nconst std::array<" << class_ << "::Target," << stateTargets_.size() << "> " << class_ << "::cpu_targets{{\n";
                 for (auto target : stateTargets_) out << '{' << target.offset << ',' << target.mask << ',' << (target.arm ? "true" : "false") << "},\n";
                 out << "}};\nconst std::array<" << class_ << "::Target," << memoryReaders_.size() << "> " << class_ << "::cpu_memory_readers{{\n";
                 for (auto target : memoryReaders_) out << '{' << target.offset << ',' << target.mask << ",false},\n";
@@ -1673,6 +1680,7 @@ inline bool cpu_shift_words_changed(const std::uint64_t *value, std::size_t valu
                 out << "}\nvoid " << class_ << "::init(){\nstd::memset(cpu_objects.get(),0," << layout_.objectBytes << ");\nstd::memset(cpu_boundary.get(),0," << layout_.boundaryBytes << ");\n"
                     << "cpu_inputs.fill(std::byte{});cpu_flags.fill(0);cpu_next_arms.fill(0);std::fill(cpu_dirty.begin(),cpu_dirty.end(),0);cpu_pending.clear();cpu_direct_again=false;cpu_read_offsets.fill(0);\n";
                 out << "for(std::size_t i=0;i<" << persistentStrings_.size() << ";++i)cpu_strings[i].clear();\ncpu_bind_strings();\n";
+                out << "cpu_profile_data={};\n";
                 out << "cpu_rng=UINT64_C(0x6a09e667f3bcc909);\n";
                 if (hasSystemTasks_) out << "cpu_first_eval=true;cpu_system_done.fill(false);cpu_strobes.clear();\n";
                 for (std::size_t i = 0; i < initChunkCount(); ++i) out << "cpu_init_" << i << "();\n";
@@ -1685,6 +1693,12 @@ inline bool cpu_shift_words_changed(const std::uint64_t *value, std::size_t valu
                     << "if(std::memcmp(cpu_objects.get()+p.offset,cpu_shadow.get()+p.offset,p.size)!=0){std::memcpy(cpu_objects.get()+p.offset,cpu_shadow.get()+p.offset,p.size);\n"
                     << "again=again||p.projection;for(std::uint32_t i=p.begin;i<p.begin+p.count;++i){if(p.memory){if(cpu_read_offsets[i]==p.offset){const auto &t=cpu_memory_readers[i];cpu_flags[t.offset]|=t.mask;}}else{const auto &t=cpu_targets[i];if(t.arm)cpu_next_arms[t.offset]=1;else cpu_flags[t.offset]|=t.mask;}}}cpu_dirty[p.state]=0;}cpu_pending.clear();return again;}\n";
                 out << "void " << class_ << "::eval(){\n";
+                out << "using cpu_profile_clock=std::chrono::steady_clock;\n"
+                    << "const bool cpu_profile=cpu_profile_enabled;\n"
+                    << "const auto cpu_profile_eval_begin=cpu_profile?cpu_profile_clock::now():cpu_profile_clock::time_point{};\n"
+                    << "auto cpu_profile_phase_begin=cpu_profile_eval_begin;\n"
+                    << "const auto cpu_profile_tick=[&](std::uint64_t &counter){if(cpu_profile){const auto now=cpu_profile_clock::now();\n"
+                    << "counter+=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now-cpu_profile_phase_begin).count());cpu_profile_phase_begin=now;}};\n";
                 for (const auto &input : model_.inputs()) out << at(model_.types()[input.type.index - 1], "cpu_objects.get()", object(ObjectRef::input(input.id)).offset)
                     << '=' << normalize("this->" + identifier(model_.text(input.name)), model_.types()[input.type.index - 1]) << ";\n";
                 std::vector<InputId> inputByValue(model_.values().size() + 1);
@@ -1700,8 +1714,14 @@ inline bool cpu_shift_words_changed(const std::uint64_t *value, std::size_t valu
                 }
                 out << "for(std::uint32_t cpu_round=0;cpu_round<100000;++cpu_round){\n";
                 CpuActivationTargets seeds{schedule_.roundSeeds, {}}; activate(out, seeds, false);
+                out << "if(cpu_profile){++cpu_profile_data.rounds;cpu_profile_phase_begin=cpu_profile_clock::now();}\n";
+                std::optional<bool> profileCompute;
                 for (const auto &task : schedule_.numaNodes[0].cores[0].tasks)
                 {
+                    const bool computePhase = task.execution == CpuExecution::ActivityDrivenCompute;
+                    if (profileCompute && *profileCompute != computePhase)
+                        out << "cpu_profile_tick(cpu_profile_data." << (*profileCompute ? "compute_ns" : "commit_ns") << ");\n";
+                    profileCompute = computePhase;
                     if (task.execution == CpuExecution::ActivityDrivenCompute)
                     {
                         out << "if(";
@@ -1718,7 +1738,9 @@ inline bool cpu_shift_words_changed(const std::uint64_t *value, std::size_t valu
                         out << "if(cpu_flags[" << armOffsets_[mapping_.partitionTree.partitions[task.partition.index - 1].parent.index] << "])";
                     out << "cpu_task_" << task.id.index << "();\n";
                 }
-                out << "const bool cpu_again=cpu_publish();\n";
+                if (profileCompute)
+                    out << "cpu_profile_tick(cpu_profile_data." << (*profileCompute ? "compute_ns" : "commit_ns") << ");\n";
+                out << "const bool cpu_again=cpu_publish();\ncpu_profile_tick(cpu_profile_data.publish_ns);\n";
                 for (const auto &slot : layout_.runtime) if (slot.kind == CpuRuntimeKind::DomainArm)
                     out << "cpu_flags[" << slot.offset << "]=cpu_next_arms[" << slot.offset << "];cpu_next_arms[" << slot.offset << "]=0;\n";
                 out << "if(!cpu_again){\n";
@@ -1726,7 +1748,14 @@ inline bool cpu_shift_words_changed(const std::uint64_t *value, std::size_t valu
                     out << "cpu_first_eval=false;for(const auto &text:cpu_strobes)std::cout<<text<<'\\n';cpu_strobes.clear();\n";
                 for (const auto &output : model_.outputs()) out << "this->" << identifier(model_.text(output.name)) << '=' <<
                     at(model_.types()[output.type.index - 1], "cpu_objects.get()", object(ObjectRef::output(output.id)).offset) << ";\n";
-                out << "return;}}throw std::runtime_error(\"CPU model did not converge\");}\n";
+                out << "if(cpu_profile){++cpu_profile_data.evals;cpu_profile_data.eval_ns+=static_cast<std::uint64_t>(\n"
+                    << "std::chrono::duration_cast<std::chrono::nanoseconds>(cpu_profile_clock::now()-cpu_profile_eval_begin).count());}\n"
+                    << "return;}}throw std::runtime_error(\"CPU model did not converge\");}\n";
+                out << "void " << class_ << "::dump_runtime_profile() const{if(!cpu_profile_data.evals)return;const auto &p=cpu_profile_data;\n"
+                    << "std::fprintf(stderr,\"[grhsim-cpu-phase] evals=%llu rounds=%llu eval_ns=%llu compute_ns=%llu commit_ns=%llu publish_ns=%llu\\n\",\n"
+                    << "static_cast<unsigned long long>(p.evals),static_cast<unsigned long long>(p.rounds),\n"
+                    << "static_cast<unsigned long long>(p.eval_ns),static_cast<unsigned long long>(p.compute_ns),\n"
+                    << "static_cast<unsigned long long>(p.commit_ns),static_cast<unsigned long long>(p.publish_ns));}\n";
                 if (hasSystemTasks_) systemTaskDriver(out);
             }
 
