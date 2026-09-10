@@ -265,6 +265,7 @@ namespace wolvrix::lib::grhsim
                 }
                 planDirectCommits();
                 planSharedHistories();
+                planComputeSharedHistories();
                 planHistoryBatches();
             }
 
@@ -279,6 +280,8 @@ namespace wolvrix::lib::grhsim
                     " history_max_pattern=" + std::to_string(historyMaxPattern_) +
                     " history_shared_states=" + std::to_string(sharedHistoryCount_) +
                     " history_shared_tasks=" + std::to_string(sharedHistoryTasks_) +
+                    " compute_history_aliases=" + std::to_string(computeSharedHistoryCount_) +
+                    " compute_history_alias_units=" + std::to_string(computeSharedHistoryUnits_) +
                     " direct_commit_states=" + std::to_string(directCommitCount_) +
                     " state_read_aliases=" + std::to_string(std::count_if(readAliases_.begin(), readAliases_.end(), [](auto id) { return bool(id); })) +
                     " memory_cell_readers=" + std::to_string(memoryReaders_.size());
@@ -421,6 +424,83 @@ namespace wolvrix::lib::grhsim
                     sharedHistoryCount_ += aliases.size();
                     ++sharedHistoryTasks_;
                     sharedHistoryTaskIds_.insert(task.id.index);
+                }
+            }
+
+            void planComputeSharedHistories()
+            {
+                std::vector<uint32_t> references(model_.states().size() + 1), initializers(references.size());
+                std::vector<std::string> constants(references.size());
+                for (auto ref : model_.objectRefPool())
+                    if (ref.kind == ObjectKind::State) ++references[ref.index];
+                for (const auto &record : model_.initRecords())
+                {
+                    ++initializers[record.state.index];
+                    const auto &type = stateType(record.state);
+                    if (type.kind != TypeKind::Logic || type.width != 1 || type.isSigned ||
+                        type.domain != LogicDomain::TwoState || model_.steps(record).size() != 1) continue;
+                    const auto &step = model_.steps(record).front();
+                    if (model_.text(step.kind) != "core.init.const") continue;
+                    if (const auto *text = parameter<std::string>(model_, model_.parameters(step), "value"))
+                        constants[record.state.index] = initLiteral(*text, type);
+                }
+                const auto sameTargets = [&](Range a, Range b) {
+                    if (a.count != b.count) return false;
+                    for (std::size_t i = 0; i < a.count; ++i)
+                    {
+                        const auto &x = stateTargets_[a.offset + i], &y = stateTargets_[b.offset + i];
+                        if (x.offset != y.offset || x.mask != y.mask || x.arm != y.arm) return false;
+                    }
+                    return true;
+                };
+                const auto &tree = mapping_.partitionTree;
+                for (const auto &task : schedule_.numaNodes[0].cores[0].tasks)
+                {
+                    if (task.execution != CpuExecution::ActivityDrivenCompute) continue;
+                    for (auto word : tree.partitions[task.partition.index - 1].children)
+                    for (auto unit : tree.partitions[word.index - 1].children)
+                    {
+                        std::map<std::tuple<uint32_t, uint32_t, std::string>, StateId> representatives;
+                        std::vector<std::pair<StateId, StateId>> aliases;
+                        for (auto node : tree.partitions[unit.index - 1].children)
+                        for (auto id : tree.partitions[node.index - 1].ops)
+                        {
+                            const auto &op = model_.operations()[id.index - 1];
+                            const auto name = model_.text(op.opType);
+                            std::size_t historyBase;
+                            if (name == "core.dpi.call") historyBase = 1;
+                            else if (name == "core.system.task") historyBase = 0;
+                            else continue;
+                            const auto *edges = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
+                            if (!edges || edges->empty()) continue;
+                            const auto operands = model_.operands(op);
+                            const auto refs = model_.objectRefs(op);
+                            if (operands.size() < edges->size() || refs.size() < historyBase + edges->size()) continue;
+                            const auto events = operands.last(edges->size());
+                            for (std::size_t i = 0; i < edges->size(); ++i)
+                            {
+                                if (refs[historyBase + i].kind != ObjectKind::State) continue;
+                                const StateId history{refs[historyBase + i].index, refs[historyBase + i].generation};
+                                const auto range = stateRanges_[history.index];
+                                if (historyAliases_[history.index] || batchedHistories_[history.index] ||
+                                    references[history.index] != 1 || initializers[history.index] != 1 ||
+                                    constants[history.index].empty() || !projected_[history.index] || range.count < 1 ||
+                                    model_.states()[history.index - 1].type != model_.values()[events[i].index - 1].type ||
+                                    layout_.types[object(refs[historyBase + i]).type.index - 1].size != 1)
+                                    continue;
+                                const auto key = std::make_tuple(events[i].index,
+                                    model_.states()[history.index - 1].type.index, constants[history.index]);
+                                const auto [it, inserted] = representatives.emplace(key, history);
+                                if (inserted) continue;
+                                if (!sameTargets(range, stateRanges_[it->second.index])) continue;
+                                aliases.emplace_back(history, it->second);
+                            }
+                        }
+                        // One unit's samples run under the same active-word bit; guards read visible history.
+                        for (auto [history, representative] : aliases) historyAliases_[history.index] = representative;
+                        computeSharedHistoryCount_ += aliases.size();
+                        computeSharedHistoryUnits_ += !aliases.empty();
+                    }
                 }
             }
 
@@ -2138,6 +2218,7 @@ if(terminal){
             std::vector<StateId> historyAliases_;
             uint64_t sharedHistoryCount_ = 0, sharedHistoryTasks_ = 0;
             std::set<uint32_t> sharedHistoryTaskIds_;
+            uint64_t computeSharedHistoryCount_ = 0, computeSharedHistoryUnits_ = 0;
             uint64_t directCommitCount_ = 0;
             std::map<uint32_t, std::vector<HistoryBatch>> historyBatches_;
             uint64_t historyCandidates_ = 0, historyPrivateRejected_ = 0, historyLayoutRejected_ = 0;

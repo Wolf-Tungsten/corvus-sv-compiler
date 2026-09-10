@@ -979,6 +979,61 @@ namespace
         require(excluded, "random histories were merged despite independent initialization");
     }
 
+    void testComputeHistorySharing(const std::filesystem::path &directory)
+    {
+        GrhSimModel model("cpu_compute_history"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto input = [&](const char *name) {
+            const auto id = model.addInput(name, bit); const auto value = model.addValue(bit);
+            const std::array results{value}; const std::array refs{ObjectRef::input(id)};
+            model.addOperation("core.input.read", {}, results, refs); return value;
+        };
+        const auto clock = input("clock"), enable = input("enable");
+        const auto history = [&](bool initial) {
+            const auto id = model.addState("h" + std::to_string(model.states().size()), bit);
+            const std::array params{Parameter{model.intern("value"), std::string(initial ? "1" : "0")}};
+            const std::array steps{InitStep{model.intern("core.init.const"), {0, 1}}};
+            model.addInit(id, steps, params); return id;
+        };
+        const auto call = [&](StateId target) {
+            const std::array operands{enable, clock};
+            const std::array refs{ObjectRef::state(target)};
+            const std::array params{Parameter{model.intern("name"), std::string("display")},
+                Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
+            model.addOperation("core.system.task", operands, {}, refs, params);
+        };
+        std::array<StateId, 8> zeroHistories;
+        for (auto &entry : zeroHistories) { entry = history(false); call(entry); }
+        std::array<StateId, 2> oneHistories;
+        for (auto &entry : oneHistories) { entry = history(true); call(entry); }
+        const auto observed = history(false); call(observed); call(observed);
+        map(model);
+        diag::Diagnostics diagnostics;
+        require(emitCpuCpp(model, directory, diagnostics).success, "compute history sharing emit failed");
+        // The mapper spreads the twelve calls over six same-task units: four zero-initializer pairs,
+        // one one-initializer pair, and one observed pair. Only same-unit lockstep pairs may merge.
+        bool sharing = false;
+        for (const auto &message : diagnostics.messages())
+            sharing |= message.message.find("compute_history_aliases=5 compute_history_alias_units=5 ") != std::string::npos;
+        require(sharing, "compute history sharing merged across units/groups or missed same-unit pairs");
+        std::string source;
+        for (const auto &file : std::filesystem::directory_iterator(directory))
+            if (file.path().extension() == ".cpp")
+            {
+                std::ifstream stream(file.path());
+                source.append(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+            }
+        const auto count = [&](const std::string &needle) {
+            std::size_t found = 0, at = 0;
+            while ((at = source.find(needle, at)) != std::string::npos) { ++found; at += needle.size(); }
+            return found;
+        };
+        require(count("cpu_system_task(\"display\"") == 12, "compute history sharing dropped a guarded system task");
+        require(count("cpu_write_scalar<bool>(") == 7, "compute history samples were not collapsed to unit representatives");
+        require(count("cpu_write_scalar<bool>(" + std::to_string(observed.index) + ",") == 2,
+                "history referenced by two calls lost an unconditional sample");
+    }
+
     void testHistoryBatches(const std::filesystem::path &directory)
     {
         GrhSimModel model("cpu_history_batch"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -1509,6 +1564,7 @@ int main(int argc, char **argv)
         testHistoryScan(directory / "history_scan");
         testStableHistorySkip(directory / "stable_history");
         testRandomHistorySharingFallback(directory / "random_history");
+        testComputeHistorySharing(directory / "compute_history");
         testHistoryBatches(directory / "history_batches");
         testPrivateCommits(directory / "private_commits");
         testScalarStaging(directory / "scalar_staging");
