@@ -282,6 +282,7 @@ SchedulePlan
   inputFanout: Map<ValueId, ActivationTargets>
   computeSupernodeFanout: Map<ValueId, ActivationTargets>
   commitStateFanout: Map<StateId, ActivationTargets>
+  quiescenceProjection: Bitmap<StateId>
   roundSeeds: PartitionId[]
   inputShadows: [value, cpu_type, offset][]
   inputShadowBytes: UInt64
@@ -321,10 +322,11 @@ guard 仍成立；只依赖 event 或 H 的变化 arm 会漏执行。B 也必须
 覆盖 A 暂存的 H=1，不能因为自己的 guard 为假或 H 已等于 B 就跳过。
 
 三张表分别在输入差分、compute value 写站点、commit state 写站点消费。`activate` 只能指向
-compute supernode，`arm` 只能指向 commit 边沿事件域。`commitStateFanout` 中的 state 真变化驱动
-下一轮 fixed-point 求值。无扇出的 input/value 没有表项；输入表的键同时确定需要变化检测的
-输入。state 表的 key 集合严格等于静止投影 E，即使某个 E 状态没有激活目标，也保留其空表项。
-`roundSeeds` 指定每次 G 应用入口必须激活的 compute supernodes；输入影子类型及字节偏移已物化。
+compute supernode，`arm` 只能指向 commit 边沿事件域。`commitStateFanout` 中的 state 真变化激活
+其读者；其中属于 E 的成员才驱动下一轮 fixed-point 求值。无扇出的 input/value 没有表项；输入表的
+键同时确定需要变化检测的输入。state 表的 key 是所有被读取的状态，E 成员身份记录于
+`quiescenceProjection` 位图，即使某个被读状态没有激活目标，也保留其空表项。
+`roundSeeds` 指定每次 G 应用入口必须激活的 compute supernodes（仅 system/DPI 属主）；输入影子类型及字节偏移已物化。
 
 `NumaNodeId` 标识目标 CPU 的一个 NUMA 内存域，`CpuCoreId` 标识该内存域中的一个 CPU 执行核。
 二者都是 CPU 后端的目标资源 ID；这里的 CPU core 与 GrhSIM `core` 方言无关。每个
@@ -358,12 +360,14 @@ activate 按 activeId 排序去重，arm 按 domain ID 排序去重。不建立 
 - `computeSupernodeFanout` 只激活跨 supernode consumers，不建立自激活边；派生 event value
   的任意变化都 arm 对应域，而不只是域要求的边沿方向。例如 posedge 域也须观察下降沿，
   否则历史停在 1，下一次上升沿会被漏掉。input value 的 arm 只在输入表中生成。
-- `commitStateFanout` 的 key 是 overview 第 4.2 节的输出/边沿状态依赖闭包。反向遍历 value
-  producer，遇到 state.read/memRead 后穿过该状态的所有写口继续传播。边沿历史本身影响判定，
+- `commitStateFanout` 覆盖所有被 compute 分区读取的状态，而不仅是 overview 第 4.2 节的
+  输出/边沿状态依赖闭包 E。E 由反向遍历 value producer、遇到 state.read/memRead 后穿过该
+  状态的所有写口继续传播得到，单独物化为 `quiescenceProjection` 位图；边沿历史本身影响判定，
   也必须入闭包；其 next 值仅依赖当前 event，不能误把未观察写口的数据口加入 E。
 - state fanout 激活 state.read/memRead 和 task/DPI history consumers；commit history 的变化
-  arm 所属域。闭包不包含的 state reader 由 `roundSeeds` 保守每轮执行，避免扩大 E 的 key 集合。
-- 所有 system function/task/DPI 的 supernode 也保守进入 `roundSeeds`，避免 `$time`、外部状态
+  arm 所属域。E 之外的 state reader 同样由 commit fanout 按真变化激活，不再每轮播种；
+  `quiescenceProjection` 只决定 pending 记录的收敛标记（非 E 状态更新不增加轮次）。
+- 所有 system function/task/DPI 的 supernode 仍保守进入 `roundSeeds`，避免 `$time`、外部状态
   或无 event 调用因缺少输入变化而永久停在首轮值。该集合不是 fullpass；后续若收窄，须证明
   调用生命周期与外部状态语义不变，并单独做性能验证。
 - `inputShadows` 与 inputFanout 逐项对应，采用 value 的 CPU 类型，在独立 arena 内分配对齐
@@ -371,7 +375,8 @@ activate 按 activeId 排序去重，arm 按 domain ID 排序去重。不建立 
 
 例如 `q1 <= d; q2 <= q1` 与输出 `q2`：E 包含 q2、q1，以及两个写口的边沿历史；反向闭包
 不会因为 q1 不直接连接输出就遗漏它。若另有不影响任何输出或边沿的 `dead <= hidden`，其
-写口的 history 仍影响边沿判断而入 E，但 dead、hidden 不会仅因这条写口有 event 就入 E。
+写口的 history 仍影响边沿判断而入 E，但 dead、hidden 不会仅因这条写口有 event 就入 E；
+二者的读者仍经 commit fanout 按真变化激活，只是不改变轮次收敛。
 
 运行时消费这些表时必须遵守：
 
@@ -381,11 +386,10 @@ activate 按 activeId 排序去重，arm 按 domain ID 排序去重。不建立 
 3. 当前轮 arm 与下一轮 arm 分开消费；轮末不能清掉刚由 state fanout 生成的下一轮 arm。
 4. 所有 SN 初始激活、所有边沿域初始 arm；每次 G 另加 roundSeeds，完整保留 event guard 精判。
 
-v1 verifier 重建 canonical schedule，检查 task 顺序/覆盖、E 闭包、已有目标和遗漏的依赖边、
-round seeds、shadow 的覆盖与偏移。JSON 在 layout 后追加 schedule，形态为：
+v1 verifier 检查模型结构；JSON 在 layout 后追加 schedule，形态为：
 
 ```text
-schedule = [numa_nodes, input_fanout, compute_fanout, state_fanout, round_seeds, input_shadows, shadow_bytes]
+schedule = [numa_nodes, input_fanout, compute_fanout, state_fanout, round_seeds, input_shadows, shadow_bytes, projection_bits, projection_words]
 numa     = [numa_id, cores]
 core     = [core_id, tasks]
 task     = [task_id, function_partition, waits_for, execution]

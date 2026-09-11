@@ -75,6 +75,80 @@ namespace
         return model;
     }
 
+    GrhSimModel traceModelNonProjectedTail()
+    {
+        // Four-register chain with only the first two stages feeding outputs. The
+        // s2->s3 tail sits outside the quiescence projection, so the s2 reader
+        // relies on commit-fanout arming rather than round seeds.
+        GrhSimModel model("register_chain_nonprojected_tail");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        std::vector<ValueId> inputs;
+        for (auto name : {"clock", "data", "enable"})
+        {
+            const auto input = model.addInput(name, bit);
+            const auto value = model.addValue(bit); const std::array results{value};
+            const std::array refs{ObjectRef::input(input)};
+            model.addOperation("core.input.read", {}, results, refs); inputs.push_back(value);
+        }
+        const auto one = model.addValue(bit); const std::array oneResults{one};
+        const std::array oneParams{Parameter{model.intern("value"), std::string("1'b1")}};
+        model.addOperation("core.compute.constant", {}, oneResults, {}, oneParams);
+        const auto state = [&]() {
+            const auto id = model.addState("s" + std::to_string(model.states().size()), bit);
+            const std::array params{Parameter{model.intern("value"), std::string("1'b0")}};
+            const std::array steps{InitStep{model.intern("core.init.const"), {0, 1}}};
+            model.addInit(id, steps, params); return id;
+        };
+        const std::array registers{state(), state(), state(), state()};
+        std::vector<ValueId> reads;
+        for (uint32_t i = 0; i < 3; ++i)
+        {
+            const auto value = model.addValue(bit); const std::array results{value};
+            const std::array refs{ObjectRef::state(registers[i])};
+            model.addOperation("core.state.read", {}, results, refs); reads.push_back(value);
+        }
+        for (uint32_t i = 0; i < 4; ++i)
+        {
+            const std::array operands{one, i == 0 ? inputs[1] : reads[i - 1], one, inputs[0]};
+            const std::array refs{ObjectRef::state(registers[i]), ObjectRef::state(state())};
+            const std::array params{Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
+            model.addOperation("core.state.regWrite", operands, {}, refs, params);
+        }
+        for (uint32_t i = 0; i < 2; ++i)
+        {
+            const auto output = model.addOutput("q" + std::to_string(i), bit);
+            const std::array outputOperands{reads[i]}; const std::array outputRefs{ObjectRef::output(output)};
+            model.addOperation("core.output.write", outputOperands, {}, outputRefs);
+        }
+        PassManager manager(defaultDialectRegistry()); std::string error;
+        for (auto name : {"cpu.st.split-phase", "cpu.st.form-event-domains", "cpu.st.build-compute-nodes",
+                          "cpu.st.merge-compute-supernodes", "cpu.st.pack-active-words", "cpu.st.pack-emit-functions",
+                          "cpu.st.layout-data", "cpu.st.build-schedule"})
+        {
+            const std::array<std::string_view, 2> nodes{"--max-op-in-compute-node", "1"};
+            const std::array<std::string_view, 2> supernodes{"--max-op-in-compute-supernode", "1"};
+            const std::span<const std::string_view> options = std::string_view(name) == "cpu.st.build-compute-nodes" ? nodes :
+                std::string_view(name) == "cpu.st.merge-compute-supernodes" ? supernodes : std::span<const std::string_view>{};
+            manager.addPass(defaultPassRegistry().create(name, options, error));
+        }
+        diag::Diagnostics diagnostics;
+        check(manager.run(model, diagnostics).success, "tail trace model mapping failed");
+        const auto &schedule = *model.cpuMapping()->schedule;
+        check(schedule.roundSeeds.empty(), "nonprojected state reader kept a round seed");
+        check(schedule.quiescenceProjection.size() == model.states().size() + 1, "projection bitmap size differs");
+        for (const auto reg : registers)
+        {
+            const bool projected = schedule.quiescenceProjection[reg.index];
+            check(projected == (reg == registers[0] || reg == registers[1]), "tail projection membership differs");
+        }
+        const auto tailRow = std::find_if(schedule.commitStateFanout.begin(), schedule.commitStateFanout.end(),
+            [&](const auto &row) { return row.source == registers[2]; });
+        check(tailRow != schedule.commitStateFanout.end() && !tailRow->targets.activate.empty(),
+              "nonprojected tail state lost its reader fanout");
+        return model;
+    }
+
     // Test-only two-state subset. Dense G traversal is independent of the sparse dispatch tables.
     class Trace
     {
@@ -138,7 +212,11 @@ namespace
                 bool again = false;
                 for (const auto &row : schedule.commitStateFanout)
                     if (oldStates[row.source.index] != states[row.source.index])
-                    { again = true; apply(row.targets, nextArms); }
+                    {
+                        apply(row.targets, nextArms);
+                        if (row.source.index < schedule.quiescenceProjection.size() &&
+                            schedule.quiescenceProjection[row.source.index]) again = true;
+                    }
                 arms_ = std::move(nextArms);
                 if (!again) return;
             }
@@ -209,5 +287,18 @@ void cpuScheduleTraceTests()
     {
         const auto sequence = generator();
         step((sequence >> 29) & 1, (sequence >> 30) & 1, (sequence >> 31) & 1);
+    }
+    const auto tailModel = traceModelNonProjectedTail(); Trace tailDense(tailModel, false), tailSparse(tailModel, true);
+    const auto tailStep = [&](uint8_t clock, uint8_t data, uint8_t enable) {
+        tailDense.eval(clock, data, enable); tailSparse.eval(clock, data, enable);
+        check(tailDense.states == tailSparse.states && tailDense.outputs == tailSparse.outputs,
+              "sparse nonprojected-tail schedule differs from dense trace");
+    };
+    tailStep(0, 1, 1); tailStep(1, 1, 1); tailStep(0, 0, 1); tailStep(1, 0, 1);
+    std::mt19937 tailGenerator(23);
+    for (uint32_t i = 0; i < 256; ++i)
+    {
+        const auto sequence = tailGenerator();
+        tailStep((sequence >> 29) & 1, (sequence >> 30) & 1, (sequence >> 31) & 1);
     }
 }

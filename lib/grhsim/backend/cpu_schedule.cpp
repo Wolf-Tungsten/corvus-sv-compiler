@@ -191,7 +191,7 @@ namespace wolvrix::lib::grhsim
                 }
                 stack.insert(stack.end(), partition.children.rbegin(), partition.children.rend());
             }
-            const auto projection = quiescenceStates(model, graph);
+            auto projection = quiescenceStates(model, graph);
             std::vector<FanoutEdge> inputEdges, computeEdges, stateEdges;
             for (const auto &state : model.states())
                 if (projection[state.id.index]) stateEdges.push_back({state.id.index, {}, false});
@@ -212,9 +212,11 @@ namespace wolvrix::lib::grhsim
                 }
                 if (type == "core.state.read" || type == "core.state.memRead")
                 {
+                    // Every state reader is armed through commit fanout, projected or not;
+                    // only side-effecting system/DPI ops keep per-round seeding. Projection
+                    // membership still decides the pending record's convergence flag.
                     for (auto ref : model.objectRefs(op))
-                        if (projection[ref.index]) stateEdges.push_back({ref.index, owner, false});
-                        else schedule.roundSeeds.push_back(owner);
+                        stateEdges.push_back({ref.index, owner, false});
                 }
                 if (type == "core.system.function" || type == "core.system.task" || type == "core.dpi.call")
                     schedule.roundSeeds.push_back(owner);
@@ -237,6 +239,7 @@ namespace wolvrix::lib::grhsim
             schedule.inputFanout = fanout<ValueId>(std::move(inputEdges), tree);
             schedule.computeSupernodeFanout = fanout<ValueId>(std::move(computeEdges), tree);
             schedule.commitStateFanout = fanout<StateId>(std::move(stateEdges), tree);
+            schedule.quiescenceProjection = std::move(projection);
             const auto addBytes = [](uint64_t a, uint64_t b) {
                 if (b > std::numeric_limits<uint64_t>::max() - a)
                     throw std::runtime_error("CPU input shadow byte size overflow");
@@ -271,7 +274,8 @@ namespace wolvrix::lib::grhsim
                 diagnostics.info("tasks=" + std::to_string(schedule.numaNodes.front().cores.front().tasks.size()) +
                                  " input_sources=" + std::to_string(schedule.inputFanout.size()) +
                                  " compute_sources=" + std::to_string(schedule.computeSupernodeFanout.size()) +
-                                 " quiescence_states=" + std::to_string(schedule.commitStateFanout.size()) +
+                                 " quiescence_states=" + std::to_string(std::count(schedule.quiescenceProjection.begin(), schedule.quiescenceProjection.end(), true)) +
+                                 " commit_states=" + std::to_string(schedule.commitStateFanout.size()) +
                                  " round_seeds=" + std::to_string(schedule.roundSeeds.size()), name());
                 auto mapping = *previous;
                 mapping.schedule = std::move(schedule);

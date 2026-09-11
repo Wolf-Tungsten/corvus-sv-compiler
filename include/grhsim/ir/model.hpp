@@ -445,8 +445,12 @@ namespace wolvrix::lib::grhsim
         std::vector<CpuNumaSchedule> numaNodes;
         std::vector<CpuFanoutEntry<ValueId>> inputFanout;
         std::vector<CpuFanoutEntry<ValueId>> computeSupernodeFanout;
-        // The key set is the exact output/event state dependency closure E.
+        // Commit fanout covers every state read by a compute partition; the key set
+        // is no longer limited to the output/event state dependency closure E.
         std::vector<CpuFanoutEntry<StateId>> commitStateFanout;
+        // State-indexed bitmap of the closure E: decides a pending record's
+        // convergence flag, not reader arming.
+        std::vector<bool> quiescenceProjection;
         std::vector<PartitionId> roundSeeds;
         std::vector<CpuInputShadow> inputShadows;
         uint64_t inputShadowBytes = 0;

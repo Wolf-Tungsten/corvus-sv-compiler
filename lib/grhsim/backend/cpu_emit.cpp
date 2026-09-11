@@ -99,11 +99,13 @@ namespace wolvrix::lib::grhsim
                         activeMasks_[partition.id.index] = 1u << (*partition.attrs.activeId % 8);
                     }
                 for (const auto &row : schedule_.computeSupernodeFanout) fanout_[row.source.index] = &row.targets;
+                projected_ = schedule_.quiescenceProjection;
+                if (projected_.size() < model_.states().size() + 1) projected_.resize(model_.states().size() + 1, false);
                 planReadAliases();
                 for (const auto &row : schedule_.commitStateFanout)
                 {
                     auto &range = stateRanges_[row.source.index];
-                    range.offset = static_cast<uint32_t>(stateTargets_.size()); projected_[row.source.index] = true;
+                    range.offset = static_cast<uint32_t>(stateTargets_.size());
                     std::map<uint32_t, uint32_t> masks;
                     for (auto target : row.targets.activate)
                         masks[activeOffsets_[target.index]] |= activeMasks_[target.index];
@@ -129,8 +131,7 @@ namespace wolvrix::lib::grhsim
                                 for (auto node : tree.partitions[unit.index - 1].children)
                                     for (auto op : tree.partitions[node.index - 1].ops) computeOwners_[op.index] = unit;
                 std::vector<bool> snapshot(readAliases_.size());
-                std::vector<bool> projected(model_.states().size() + 1);
-                for (const auto &row : schedule_.commitStateFanout) projected[row.source.index] = true;
+                const auto &projected = projected_;
                 for (const auto &op : model_.operations())
                     if (!computeOwners_[op.id.index])
                         for (auto operand : model_.operands(op)) snapshot[operand.index] = true;

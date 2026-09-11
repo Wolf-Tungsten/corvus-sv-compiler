@@ -217,11 +217,20 @@ namespace
         std::set<uint32_t> expected{fixture.q1.index, fixture.q2.index, fixture.q3.index, fixture.upstream.index, fixture.other.index};
         for (auto state : fixture.histories) expected.insert(state.index);
         std::set<uint32_t> actual;
-        for (const auto &row : schedule.commitStateFanout) actual.insert(row.source.index);
+        for (std::size_t index = 0; index < schedule.quiescenceProjection.size(); ++index)
+            if (schedule.quiescenceProjection[index]) actual.insert(index);
         require(actual == expected, "E omitted transitive writer/history state or included dead state/data");
+        std::set<uint32_t> tracked = expected;
+        tracked.insert(fixture.dead.index); tracked.insert(fixture.offData.index);
+        std::set<uint32_t> fanoutKeys;
+        for (const auto &row : schedule.commitStateFanout) fanoutKeys.insert(row.source.index);
+        require(fanoutKeys == tracked, "commit fanout omitted a read state or tracked an unread one");
         const auto owner = [&](ValueId id) { return mapping.dataLayout->values[id.index - 1].owner; };
-        require(contains(schedule.roundSeeds, owner(fixture.deadRead)) && contains(schedule.roundSeeds, owner(fixture.time)),
-                "unobserved state reader or external time source was not seeded");
+        require(targets(schedule.commitStateFanout, fixture.dead) &&
+                contains(targets(schedule.commitStateFanout, fixture.dead)->activate, owner(fixture.deadRead)),
+                "nonprojected state reader was not armed by commit fanout");
+        require(!contains(schedule.roundSeeds, owner(fixture.deadRead)) && contains(schedule.roundSeeds, owner(fixture.time)),
+                "unobserved state reader kept its seed or external time source was not seeded");
         require(!targets(schedule.inputFanout, fixture.unused), "unused input got a shadow");
         require(targets(schedule.inputFanout, fixture.duplicateClock) &&
                 contains(targets(schedule.inputFanout, fixture.clkA)->activate, owner(fixture.clkA)),

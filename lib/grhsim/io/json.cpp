@@ -615,7 +615,13 @@ namespace wolvrix::lib::grhsim
                 writer.startArray(); writeId(writer, shadow.value); writeId(writer, shadow.type);
                 writer.value(shadow.offset); writer.endArray();
             }
-            writer.endArray(); writer.value(schedule.inputShadowBytes); writer.endArray();
+            writer.endArray(); writer.value(schedule.inputShadowBytes);
+            std::vector<std::uint64_t> projectionWords((schedule.quiescenceProjection.size() + 63) / 64);
+            for (std::size_t bit = 0; bit < schedule.quiescenceProjection.size(); ++bit)
+                if (schedule.quiescenceProjection[bit]) projectionWords[bit / 64] |= std::uint64_t(1) << (bit % 64);
+            writer.value(static_cast<std::uint64_t>(schedule.quiescenceProjection.size())); writer.startArray();
+            for (const auto word : projectionWords) writer.value(word);
+            writer.endArray(); writer.endArray();
         }
 
         void writeCpuMapping(StreamWriter &writer, const CpuBackendMapping &cpu)
@@ -798,7 +804,18 @@ namespace wolvrix::lib::grhsim
                 expectComma(reader); shadow.offset = reader.unsignedInteger(); reader.endArray();
                 schedule.inputShadows.push_back(shadow);
             }
-            expectComma(reader); schedule.inputShadowBytes = reader.unsignedInteger(); reader.endArray();
+            expectComma(reader); schedule.inputShadowBytes = reader.unsignedInteger();
+            expectComma(reader); const auto projectionBits = reader.index("quiescence projection bits", false);
+            expectComma(reader); schedule.quiescenceProjection.assign(projectionBits, false);
+            reader.startArray(); first = true;
+            std::size_t bit = 0;
+            while (reader.nextArray(first))
+            {
+                const auto word = reader.unsignedInteger();
+                for (std::size_t i = 0; i < 64 && bit < projectionBits; ++i, ++bit)
+                    if ((word >> i) & 1) schedule.quiescenceProjection[bit] = true;
+            }
+            reader.endArray();
             return schedule;
         }
 

@@ -1174,7 +1174,10 @@ namespace
         const std::array params{Parameter{model.intern("event_edges"), std::vector<std::string>{}}};
         model.addOperation("core.dpi.call", callOperands, {}, refs, params);
         map(model);
-        require(model.cpuMapping()->schedule->commitStateFanout.empty(), "private fixture accidentally added a quiescence root");
+        require(model.cpuMapping()->schedule->commitStateFanout.size() == 3, "private fixture lost its state-read commit fanout");
+        const auto &privateProjection = model.cpuMapping()->schedule->quiescenceProjection;
+        require(std::none_of(privateProjection.begin(), privateProjection.end(), [](bool projected) { return projected; }),
+                "private fixture accidentally added a quiescence root");
         diag::Diagnostics diagnostics; std::stringstream json;
         require(writeGrhSimJson(model, json, defaultDialectRegistry(), diagnostics), "private commit JSON write failed");
         auto restored = readGrhSimJson(json, defaultDialectRegistry(), diagnostics);
