@@ -296,6 +296,13 @@ namespace wolvrix::lib::grhsim
                     " memory_cell_readers=" + std::to_string(memoryReaders_.size());
             }
 
+            std::string packSummary() const
+            {
+                return "dispatch_packed_checks=" + std::to_string(dispatchPackedBytes_) +
+                    " handoff_packed_slots=" + std::to_string(handoffPackedSlots_) +
+                    " port_arm_walk_packed_words=" + std::to_string(pflagPackedWords_);
+            }
+
             PassResult write(const std::filesystem::path &directory)
             {
                 if (std::filesystem::exists(directory) && !std::filesystem::is_empty(directory))
@@ -1888,6 +1895,8 @@ namespace wolvrix::lib::grhsim
             {
                 out << "#pragma once\n#include \"" << prefix_ << "_runtime.hpp\"\n#include <memory>\n#include <stdexcept>\n";
                 out << "template<class T> inline T &cpu_at(std::byte *data, std::size_t offset){return *reinterpret_cast<T*>(data+offset);}\n";
+                // Zero test over a run of activity bytes; byte order is irrelevant for emptiness.
+                out << "inline std::uint64_t cpu_word8(const std::uint8_t *data, std::size_t offset, std::size_t bytes){std::uint64_t value=0;std::memcpy(&value,data+offset,bytes);return value;}\n";
                 // Tracked outputs are persistent initialized slots; local writes use the legacy helpers.
                 out << R"CPP(template<char Operation>
 inline bool cpu_bitwise_words_changed(const std::uint64_t *lhs, std::size_t lhsWords,
@@ -2115,34 +2124,103 @@ inline bool cpu_shift_words_changed(const std::uint64_t *value, std::size_t valu
                 out << "for(std::uint32_t cpu_round=0;cpu_round<100000;++cpu_round){\n";
                 CpuActivationTargets seeds{schedule_.roundSeeds, {}}; activate(out, seeds, false);
                 out << "if(cpu_profile){++cpu_profile_data.rounds;cpu_profile_phase_begin=cpu_profile_clock::now();}\n";
-                std::optional<bool> profileCompute;
+                // Word-packed dispatch: adjacent single-byte task checks sharing one
+                // 8-byte flags bucket get a uint64 emptiness prefilter; a zero word
+                // proves every covered check false, so task order and semantics are
+                // unchanged. Other tasks (multi-word, unconditional) emit as before.
+                struct DispatchEntry
+                {
+                    std::string text;
+                    std::uint32_t offset = ~std::uint32_t(0);
+                    bool compute = false;
+                };
+                std::vector<DispatchEntry> dispatch;
+                dispatch.reserve(schedule_.numaNodes[0].cores[0].tasks.size());
                 for (const auto &task : schedule_.numaNodes[0].cores[0].tasks)
                 {
-                    const bool computePhase = task.execution == CpuExecution::ActivityDrivenCompute;
-                    if (profileCompute && *profileCompute != computePhase)
-                        out << "cpu_profile_tick(cpu_profile_data." << (*profileCompute ? "compute_ns" : "commit_ns") << ");\n";
-                    profileCompute = computePhase;
-                    if (task.execution == CpuExecution::ActivityDrivenCompute)
+                    DispatchEntry entry;
+                    entry.compute = task.execution == CpuExecution::ActivityDrivenCompute;
+                    std::string condition;
+                    if (entry.compute)
                     {
-                        out << "if(";
                         bool first = true;
                         for (const auto word : mapping_.partitionTree.partitions[task.partition.index - 1].children)
                         {
-                            if (!first) out << "||";
-                            out << "cpu_flags[" << wordOffsets_[word.index] << "]";
+                            if (!first) condition += "||";
+                            const auto offset = wordOffsets_[word.index];
+                            condition += "cpu_flags[" + std::to_string(offset) + "]";
+                            if (first) entry.offset = offset;
+                            else entry.offset = ~std::uint32_t(0);
                             first = false;
                         }
-                        out << ")";
                     }
                     else if (task.execution == CpuExecution::DomainGatedCommit)
-                        out << "if(cpu_flags[" << armOffsets_[mapping_.partitionTree.partitions[task.partition.index - 1].parent.index] << "])";
-                    out << "cpu_task_" << task.id.index << "();\n";
+                    {
+                        entry.offset = armOffsets_[mapping_.partitionTree.partitions[task.partition.index - 1].parent.index];
+                        condition = "cpu_flags[" + std::to_string(entry.offset) + "]";
+                    }
+                    if (!condition.empty()) entry.text = "if(" + condition + ")";
+                    entry.text += "cpu_task_" + std::to_string(task.id.index) + "();\n";
+                    dispatch.push_back(std::move(entry));
+                }
+                std::optional<bool> profileCompute;
+                for (std::size_t cursor = 0; cursor < dispatch.size();)
+                {
+                    const bool computePhase = dispatch[cursor].compute;
+                    if (profileCompute && *profileCompute != computePhase)
+                        out << "cpu_profile_tick(cpu_profile_data." << (*profileCompute ? "compute_ns" : "commit_ns") << ");\n";
+                    profileCompute = computePhase;
+                    std::size_t end = cursor + 1;
+                    if (dispatch[cursor].offset != ~std::uint32_t(0))
+                    {
+                        const std::uint32_t bucket = dispatch[cursor].offset / 8;
+                        while (end < dispatch.size() && dispatch[end].offset != ~std::uint32_t(0) &&
+                               dispatch[end].compute == computePhase && dispatch[end].offset / 8 == bucket)
+                            ++end;
+                        if (end - cursor >= 2)
+                        {
+                            const std::uint32_t base = bucket * 8;
+                            out << "if(cpu_word8(cpu_flags.data()," << base << ','
+                                << std::min<std::uint32_t>(8, layout_.runtimeBytes - base) << ")){";
+                            for (std::size_t index = cursor; index < end; ++index) out << dispatch[index].text;
+                            out << "}\n";
+                            dispatchPackedBytes_ += end - cursor;
+                            cursor = end;
+                            continue;
+                        }
+                    }
+                    for (std::size_t index = cursor; index < end; ++index) out << dispatch[index].text;
+                    cursor = end;
                 }
                 if (profileCompute)
                     out << "cpu_profile_tick(cpu_profile_data." << (*profileCompute ? "compute_ns" : "commit_ns") << ");\n";
                 out << "const bool cpu_again=cpu_publish();\ncpu_profile_tick(cpu_profile_data.publish_ns);\n";
-                for (const auto &slot : layout_.runtime) if (slot.kind == CpuRuntimeKind::DomainArm)
-                    out << "cpu_flags[" << slot.offset << "]=cpu_next_arms[" << slot.offset << "];cpu_next_arms[" << slot.offset << "]=0;\n";
+                // A domain slot needs the copy/clear only when its next-arm or current
+                // flag byte is non-zero; bucket prefilters keep the per-slot semantics.
+                std::vector<std::uint32_t> domainSlots;
+                for (const auto &slot : layout_.runtime) if (slot.kind == CpuRuntimeKind::DomainArm) domainSlots.push_back(slot.offset);
+                std::sort(domainSlots.begin(), domainSlots.end());
+                for (std::size_t cursor = 0; cursor < domainSlots.size();)
+                {
+                    const std::uint32_t bucket = domainSlots[cursor] / 8;
+                    std::size_t end = cursor + 1;
+                    while (end < domainSlots.size() && domainSlots[end] / 8 == bucket) ++end;
+                    if (end - cursor >= 2)
+                    {
+                        const std::uint32_t base = bucket * 8;
+                        const auto bytes = std::min<std::uint32_t>(8, layout_.runtimeBytes - base);
+                        out << "if((cpu_word8(cpu_next_arms.data()," << base << ',' << bytes
+                            << ")|cpu_word8(cpu_flags.data()," << base << ',' << bytes << "))!=0){";
+                        for (std::size_t index = cursor; index < end; ++index)
+                            out << "cpu_flags[" << domainSlots[index] << "]=cpu_next_arms[" << domainSlots[index] << "];cpu_next_arms[" << domainSlots[index] << "]=0;\n";
+                        out << "}\n";
+                        handoffPackedSlots_ += end - cursor;
+                    }
+                    else
+                        for (std::size_t index = cursor; index < end; ++index)
+                            out << "cpu_flags[" << domainSlots[index] << "]=cpu_next_arms[" << domainSlots[index] << "];cpu_next_arms[" << domainSlots[index] << "]=0;\n";
+                    cursor = end;
+                }
                 out << "if(!cpu_again){\n";
                 if (hasSystemTasks_)
                     out << "cpu_first_eval=false;for(const auto &text:cpu_strobes)std::cout<<text<<'\\n';cpu_strobes.clear();\n";
@@ -2431,30 +2509,49 @@ if(terminal){
                     // is set). Bits are consumed only for ports whose edge
                     // guard actually fires here; unarmed ports provably end
                     // in current==value, so state updates and notifications
-                    // are unchanged.
-                    std::uint32_t openWord = ~std::uint32_t(0);
+                    // are unchanged. The per-word walk additionally gets a
+                    // uint64 emptiness prefilter per 8-word group: a zero word
+                    // proves all covered per-word blocks no-ops, leaving
+                    // consumption and persistence semantics untouched.
                     if (anyArmed)
+                    {
+                        std::map<std::uint32_t, std::vector<OpId>> wordOps;
                         for (auto unit : tree.partitions[task.partition.index - 1].children)
                             for (auto op : tree.partitions[unit.index - 1].ops)
                             {
                                 const auto word = portArmWords_[op.index];
                                 if (word == ~std::uint32_t(0)) continue;
-                                const auto &operation = model_.operations()[op.index - 1];
-                                if (word != openWord)
-                                {
-                                    if (openWord != ~std::uint32_t(0))
-                                        out << "cpu_pflags[" << openWord << "]&=~cpu_consumed;}}\n";
-                                    out << "{const std::uint8_t cpu_armed=cpu_pflags[" << word << "];if(cpu_armed){std::uint8_t cpu_consumed=0;\n";
-                                    openWord = word;
-                                }
-                                const auto bit = 1u << portArmBits_[op.index];
-                                out << "if(cpu_armed&" << bit << "){if(" << commitEdgeGuard(operation, findGuard(op)) << "){cpu_consumed|="
-                                    << bit << ";if(" << value(model_.operands(operation)[0]) << "){\n";
-                                directCommitBody(out, operation);
-                                out << "}}}\n";
+                                wordOps[word].push_back(op);
                             }
-                    if (openWord != ~std::uint32_t(0))
-                        out << "cpu_pflags[" << openWord << "]&=~cpu_consumed;}}\n";
+                        for (auto it = wordOps.cbegin(); it != wordOps.cend();)
+                        {
+                            const std::uint32_t base = it->first;
+                            std::vector<std::map<std::uint32_t, std::vector<OpId>>::const_iterator> group;
+                            for (auto next = it; next != wordOps.end() && next->first < base + 8; ++next) group.push_back(next);
+                            it = group.empty() ? std::next(it) : std::next(group.back());
+                            const bool packed = group.size() >= 2;
+                            if (packed)
+                            {
+                                out << "if(cpu_word8(cpu_pflags.data()," << base << ',' << (group.back()->first - base + 1) << ")){\n";
+                                pflagPackedWords_ += group.size();
+                            }
+                            for (auto entry : group)
+                            {
+                                out << "{const std::uint8_t cpu_armed=cpu_pflags[" << entry->first << "];if(cpu_armed){std::uint8_t cpu_consumed=0;\n";
+                                for (auto op : entry->second)
+                                {
+                                    const auto &operation = model_.operations()[op.index - 1];
+                                    const auto bit = 1u << portArmBits_[op.index];
+                                    out << "if(cpu_armed&" << bit << "){if(" << commitEdgeGuard(operation, findGuard(op)) << "){cpu_consumed|="
+                                        << bit << ";if(" << value(model_.operands(operation)[0]) << "){\n";
+                                    directCommitBody(out, operation);
+                                    out << "}}}\n";
+                                }
+                                out << "cpu_pflags[" << entry->first << "]&=~cpu_consumed;}}\n";
+                            }
+                            if (packed) out << "}\n";
+                        }
+                    }
                     // Private shadow writes commute; guards keep reading individual visible histories.
                     if (const auto batches = historyBatches_.find(task.id.index); batches != historyBatches_.end())
                         for (const auto &batch : batches->second) sampleHistoryBatch(out, batch);
@@ -2568,6 +2665,7 @@ if(terminal){
             std::vector<std::vector<PortArmTarget>> portArmTargets_;
             std::uint32_t portArmWordCount_ = 0;
             std::uint64_t portArmPortCount_ = 0, portArmTaskCount_ = 0, portArmValueCount_ = 0;
+            mutable std::uint64_t dispatchPackedBytes_ = 0, handoffPackedSlots_ = 0, pflagPackedWords_ = 0;
         };
 
         class EmitCppPass final : public Pass
@@ -2589,7 +2687,9 @@ if(terminal){
         {
             Emitter emitter(model); emitter.validate();
             diagnostics.info(emitter.historyBatchSummary(), "cpu.st.emit-cpp");
-            return emitter.write(directory);
+            auto result = emitter.write(directory);
+            diagnostics.info(emitter.packSummary(), "cpu.st.emit-cpp");
+            return result;
         }
         catch (const std::exception &error)
         { diagnostics.error(error.what(), "cpu.st.emit-cpp"); return {false, false, {}}; }

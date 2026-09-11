@@ -557,6 +557,22 @@ state.read 别名，且生产者仅限 `core.compute.*`、`core.state.read`、`c
 武装位持续直到被消费，跨 round、跨 eval 有效；同一 eval 内 compute 的新变化在
 下一轮重新武装。发射器诊断给出 `port_arm_ports/tasks/values/words`。
 
+### CPU C++ 活动扫描字打包
+
+逐轮稠密扫描统一加字粒度空测试预过滤：调度循环中共享同一 8 字节 `cpu_flags`
+桶的相邻单字节任务检查、domain-arm 逐槽交接（`cpu_flags[s]=cpu_next_arms[s]` 加
+清零）、以及 commit 任务 `cpu_pflags` 武装段的逐字节走查，都先在桶范围上用
+`cpu_word8`（定长 `std::memcpy` 装入 `std::uint64_t`，字节序与空测试无关）检测
+是否全零。全零证明桶内每个字节检查都是无操作：没有任务会执行、没有槽需要拷贝
+或清除（交接桶测试 `next_arms|flags`，两侧都零时逐槽写本身就是恒等）、没有端口
+字会消费武装位；非零则进入桶并逐字节执行原逻辑，顺序与语义逐位不变。
+
+打包只覆盖同桶相邻且不少于 2 项的组，组内保持原发射顺序；多 word 任务、无
+条件任务、孤立槽位与不足 8 字节的尾组仍按原标量形式发射（尾组用收窄的定长
+`memcpy`，不越界）。预过滤只读取活动数组，不引入队列、不改变武装/消费/发布
+路径。发射器在写完模型后报告 `dispatch_packed_checks`、
+`handoff_packed_slots`、`port_arm_walk_packed_words`。
+
 ### CPU C++ 宽位运算活动度
 
 compute word 调度沿用 legacy 局部活动字节结构：读取 `cpu_flags[wordOffset]` 到
