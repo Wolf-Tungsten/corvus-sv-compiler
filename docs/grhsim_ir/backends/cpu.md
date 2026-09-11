@@ -573,6 +573,32 @@ state.read 别名，且生产者仅限 `core.compute.*`、`core.state.read`、`c
 路径。发射器在写完模型后报告 `dispatch_packed_checks`、
 `handoff_packed_slots`、`port_arm_walk_packed_words`。
 
+### CPU C++ 边沿静默跳过
+
+compute supernode 的全部外部效应都来自边沿守卫的 system/DPI op（守卫项
+`(!hist && event)` / `(hist && !event)` 及其内嵌历史采样）时，该 supernode 在
+入口满足所有守卫项 `hist == event` 的激活是 provably inert：两个方向的边沿守卫
+都为假，内嵌历史采样是 `current == next` 的无操作（本轮内该 supernode 尚未执行，
+历史态不是 dirty，守卫读取的 `cpu_objects` 值正是采样 helper 要比较的 current；
+别名历史根本没有采样发射，`stage()` 直接返回，其守卫经 `object()` 解析读同一个
+代表元）。frame 清零、局部字符串与全部 frame-local 计算都是每次激活的临时量，
+没有跨 supernode 可见性。发射器把合格 supernode 的函数体包进
+`if((hist0)!=(event0) || ...){ ... }`，每次激活先求值；活动字节读取/清除、位
+消费与归还、播种、轮次与收敛结构完全不动，被跳过的执行与执行惰性函数体逐位
+一致：没有 pending 记录、没有 fanout、没有状态变化。
+
+合格性按 supernode 静态判定（全部 op 须通过）：边沿守卫的
+`core.system.task`/`core.dpi.call`（事件不在本 supernode 内产生、且是可见状态或
+boundary 读取——与 compute 守卫提升相同的不变量测试）贡献去重后的
+（别名解析 history，event）项；其余 op 只能是纯 frame-local 计算（不写
+boundary/object/shadow、无 fanout、无端口武装目标、不更新 `cpu_read_offsets`）。
+含无 `event_edges` 的电平调用、`core.output.write`、带返回值的 DPI、boundary
+写回的 supernode 不合格；任一守卫历史若在模型范围内被本 supernode 的边沿项之外
+引用（含别名前像）或为 batched history，同样不合格——共享历史按程序序覆盖
+pending 值，外部采样者会让被跳过的采样变得可观察。检查项为每个去重项的
+`(state(hist))!=(value(event))`，发射在 frame 清零之前。发射器诊断报告
+`compute_quiescence_units`/`compute_quiescence_terms`。
+
 ### CPU C++ 宽位运算活动度
 
 compute word 调度沿用 legacy 局部活动字节结构：读取 `cpu_flags[wordOffset]` 到

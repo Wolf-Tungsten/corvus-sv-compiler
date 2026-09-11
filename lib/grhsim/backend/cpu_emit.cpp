@@ -270,6 +270,7 @@ namespace wolvrix::lib::grhsim
                 planComputeEdgeGuards();
                 planHistoryBatches();
                 planPortArms();
+                planComputeQuiescence();
             }
 
             std::string historyBatchSummary() const
@@ -287,6 +288,8 @@ namespace wolvrix::lib::grhsim
                     " compute_history_alias_units=" + std::to_string(computeSharedHistoryUnits_) +
                     " compute_guard_snapshots=" + std::to_string(computeGuardSnapshots_) +
                     " compute_guard_snapshot_uses=" + std::to_string(computeGuardUses_) +
+                    " compute_quiescence_units=" + std::to_string(computeQuiescenceUnits_) +
+                    " compute_quiescence_terms=" + std::to_string(computeQuiescenceTerms_) +
                     " direct_commit_states=" + std::to_string(directCommitCount_) +
                     " port_arm_ports=" + std::to_string(portArmPortCount_) +
                     " port_arm_tasks=" + std::to_string(portArmTaskCount_) +
@@ -477,6 +480,113 @@ namespace wolvrix::lib::grhsim
                 for (const auto &target : targets)
                     out << "cpu_pflags[" << target.offset << "] |= (static_cast<std::uint8_t>(-static_cast<std::uint8_t>("
                         << condition << ")) & " << target.mask << ");\n";
+            }
+
+            struct QuiescenceTerm { StateId history; ValueId event; };
+
+            // Compute-side edge-quiescence skip: a unit whose every external
+            // effect is edge-guarded (system/DPI calls and their embedded
+            // history samples) is provably inert when hist == event holds for
+            // every guard term at unit entry — all edge guards are false and
+            // every sample is a current==next no-op. Frame and frame-local
+            // computations are per-invocation temporaries. The body of such a
+            // unit is wrapped in an entry check; scheduling is untouched.
+            void planComputeQuiescence()
+            {
+                std::vector<uint32_t> references(model_.states().size() + 1);
+                for (auto ref : model_.objectRefPool())
+                    if (ref.kind == ObjectKind::State) ++references[ref.index];
+                std::vector<std::vector<uint32_t>> preimage(model_.states().size() + 1);
+                for (std::size_t index = 1; index < historyAliases_.size(); ++index)
+                    if (historyAliases_[index]) preimage[historyAliases_[index].index].push_back(index);
+                const auto &tree = mapping_.partitionTree;
+                for (const auto &task : schedule_.numaNodes[0].cores[0].tasks)
+                {
+                    if (task.execution != CpuExecution::ActivityDrivenCompute) continue;
+                    for (auto word : tree.partitions[task.partition.index - 1].children)
+                    for (auto unit : tree.partitions[word.index - 1].children)
+                    {
+                        const auto &partition = tree.partitions[unit.index - 1];
+                        std::vector<OpId> ops;
+                        for (auto node : partition.children)
+                            ops.insert(ops.end(), tree.partitions[node.index - 1].ops.begin(), tree.partitions[node.index - 1].ops.end());
+                        std::set<uint32_t> produced;
+                        for (auto id : ops)
+                            for (auto result : model_.results(model_.operations()[id.index - 1])) produced.insert(result.index);
+                        std::vector<QuiescenceTerm> terms;
+                        std::map<uint32_t, uint32_t> termRefs;
+                        bool eligible = true;
+                        for (auto id : ops)
+                        {
+                            if (!eligible) break;
+                            const auto &op = model_.operations()[id.index - 1];
+                            const auto name = model_.text(op.opType);
+                            const bool system = name == "core.system.task", dpi = name == "core.dpi.call";
+                            if (system || dpi)
+                            {
+                                if (!model_.results(op).empty()) { eligible = false; break; }
+                                const auto *edges = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
+                                if (!edges || edges->empty()) { eligible = false; break; }
+                                const auto events = model_.operands(op).last(edges->size());
+                                const auto refs = model_.objectRefs(op);
+                                const std::size_t historyBase = dpi ? 1 : 0;
+                                if (refs.size() < historyBase + edges->size()) { eligible = false; break; }
+                                for (std::size_t i = 0; i < edges->size() && eligible; ++i)
+                                {
+                                    if (refs[historyBase + i].kind != ObjectKind::State) { eligible = false; break; }
+                                    const auto event = events[i];
+                                    // Same in-unit invariance test as planComputeEdgeGuards.
+                                    if (produced.contains(event.index) ||
+                                        (!readAliases_[event.index] && layout_.values[event.index - 1].kind != CpuStorageKind::Boundary))
+                                    { eligible = false; break; }
+                                    const auto alias = historyAliases_[refs[historyBase + i].index];
+                                    const StateId history{alias ? alias.index : refs[historyBase + i].index, 0};
+                                    if (batchedHistories_[history.index]) { eligible = false; break; }
+                                    ++termRefs[history.index];
+                                    const auto duplicate = std::any_of(terms.begin(), terms.end(), [&](const QuiescenceTerm &term) {
+                                        return term.history.index == history.index && term.event.index == event.index; });
+                                    if (!duplicate) terms.push_back({history, event});
+                                }
+                                continue;
+                            }
+                            const auto results = model_.results(op);
+                            if (results.size() != 1) { eligible = false; break; }
+                            const auto result = results[0];
+                            if (readAliases_[result.index]) continue;
+                            if (type(result).kind == TypeKind::String && staticStrings_.contains(result.index)) continue;
+                            if (memoryReadIds_[op.id.index] || fanout_[result.index] || portArmTargets(result) ||
+                                layout_.values[result.index - 1].kind != CpuStorageKind::PartitionLocal)
+                            { eligible = false; break; }
+                        }
+                        if (!eligible || terms.empty()) continue;
+                        // A guard history must be referenced only by this unit's
+                        // own edge terms (including alias preimages): shared
+                        // histories overwrite pending values in program order,
+                        // so an external sampler would make the skipped sample
+                        // observable.
+                        for (const auto &[resolved, count] : termRefs)
+                        {
+                            uint32_t total = references[resolved];
+                            for (auto index : preimage[resolved]) total += references[index];
+                            if (total != count) { eligible = false; break; }
+                        }
+                        if (!eligible) continue;
+                        computeQuiescenceTerms_ += terms.size();
+                        ++computeQuiescenceUnits_;
+                        computeQuiescence_[unit.index] = std::move(terms);
+                    }
+                }
+            }
+
+            std::string quiescenceCheck(const std::vector<QuiescenceTerm> &terms) const
+            {
+                std::string check;
+                for (const auto &term : terms)
+                {
+                    if (!check.empty()) check += " || ";
+                    check += '(' + state(term.history) + "!=" + value(term.event) + ')';
+                }
+                return check;
             }
 
             void planSharedHistories()
@@ -2564,8 +2674,15 @@ if(terminal){
                         for (auto unit : tree.partitions[word.index - 1].children)
                         {
                             const auto &partition = tree.partitions[unit.index - 1];
-                            out << "if(cpu_active_word&" << activeMasks_[unit.index] << "){cpu_active_word&=~" << activeMasks_[unit.index] << ";\n"
-                                << "alignas(8) std::byte cpu_local[" << std::max<uint64_t>(frameSizes_[unit.index], 1) << "]{};\n";
+                            out << "if(cpu_active_word&" << activeMasks_[unit.index] << "){cpu_active_word&=~" << activeMasks_[unit.index] << ";\n";
+                            // Quiescent units (hist == event on every guard term) are inert: all
+                            // edge guards are false and every embedded history sample is a
+                            // current==next no-op, so the whole body is skipped.
+                            const auto quiescence = computeQuiescence_.find(unit.index);
+                            const bool quiescent = quiescence != computeQuiescence_.end() && !quiescence->second.empty();
+                            if (quiescent)
+                                out << "if(" << quiescenceCheck(quiescence->second) << "){ // cpu_quiescence_skip unit=" << unit.index << '\n';
+                            out << "alignas(8) std::byte cpu_local[" << std::max<uint64_t>(frameSizes_[unit.index], 1) << "]{};\n";
                             // Strings outlive all helper calls for this supernode invocation.
                             for (auto stringOffset : localStrings_[unit.index])
                                 out << "std::string cpu_string_" << stringOffset << ";cpu_at<std::string*>(cpu_local,"
@@ -2594,6 +2711,7 @@ if(terminal){
                                 const auto guards = computeGuardMap(unit);
                                 computeGroup(out, ops, unit, guards);
                             }
+                            if (quiescent) out << "}\n";
                             out << "}\n";
                         }
                         out << "cpu_flags[" << offset << "]|=cpu_active_word;}}\n";
@@ -2656,6 +2774,8 @@ if(terminal){
             uint64_t computeSharedHistoryCount_ = 0, computeSharedHistoryUnits_ = 0;
             uint64_t computeGuardSnapshots_ = 0, computeGuardUses_ = 0;
             std::map<std::uint32_t, std::vector<ComputeGuardGroup>> computeGuardGroups_;
+            std::map<std::uint32_t, std::vector<QuiescenceTerm>> computeQuiescence_;
+            uint64_t computeQuiescenceUnits_ = 0, computeQuiescenceTerms_ = 0;
             uint64_t directCommitCount_ = 0;
             std::map<uint32_t, std::vector<HistoryBatch>> historyBatches_;
             uint64_t historyCandidates_ = 0, historyPrivateRejected_ = 0, historyLayoutRejected_ = 0;
