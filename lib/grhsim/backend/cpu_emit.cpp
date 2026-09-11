@@ -209,7 +209,7 @@ namespace wolvrix::lib::grhsim
                     "cpu_bitwise_words_changed", "cpu_arithmetic_words_changed", "cpu_shift_words_changed", "cpu_active_word",
                     "CpuRuntimeProfile", "cpu_runtime_profile", "cpu_profile_enabled", "cpu_profile_data", "cpu_profile",
                     "cpu_profile_clock", "cpu_profile_eval_begin", "cpu_profile_phase_begin", "cpu_profile_tick",
-                    "cpu_stage_cell", "cpu_memory_readers", "cpu_read_offsets"};
+                    "cpu_stage_cell", "cpu_memory_readers", "cpu_read_offsets", "cpu_pflags", "cpu_armed", "cpu_consumed"};
                 if (hasSystemTasks_)
                     for (const auto *name : {"cpu_first_eval", "cpu_system_done", "cpu_strobes", "cpu_system_task"}) names.insert(name);
                 for (std::size_t i = 0; i < initChunkCount(); ++i) names.insert("cpu_init_" + std::to_string(i));
@@ -269,6 +269,7 @@ namespace wolvrix::lib::grhsim
                 planComputeSharedHistories();
                 planComputeEdgeGuards();
                 planHistoryBatches();
+                planPortArms();
             }
 
             std::string historyBatchSummary() const
@@ -287,6 +288,10 @@ namespace wolvrix::lib::grhsim
                     " compute_guard_snapshots=" + std::to_string(computeGuardSnapshots_) +
                     " compute_guard_snapshot_uses=" + std::to_string(computeGuardUses_) +
                     " direct_commit_states=" + std::to_string(directCommitCount_) +
+                    " port_arm_ports=" + std::to_string(portArmPortCount_) +
+                    " port_arm_tasks=" + std::to_string(portArmTaskCount_) +
+                    " port_arm_values=" + std::to_string(portArmValueCount_) +
+                    " port_arm_words=" + std::to_string(portArmWordCount_) +
                     " state_read_aliases=" + std::to_string(std::count_if(readAliases_.begin(), readAliases_.end(), [](auto id) { return bool(id); })) +
                     " memory_cell_readers=" + std::to_string(memoryReaders_.size());
             }
@@ -340,6 +345,12 @@ namespace wolvrix::lib::grhsim
             }
 
         private:
+            struct PortArmTarget
+            {
+                std::uint32_t offset;
+                std::uint32_t mask;
+            };
+
             void planDirectCommits()
             {
                 std::vector<uint32_t> references(model_.states().size() + 1), allowed(references.size()), writers(references.size());
@@ -367,6 +378,98 @@ namespace wolvrix::lib::grhsim
                         ++directCommitCount_;
                     }
                 }
+            }
+
+            // A direct-commit write port whose enable/data/mask operands are
+            // all boundary-resident scalar values may skip evaluation at an
+            // edge when none of those operands changed since the port's last
+            // evaluation: the unique writer keeps `current` stable, so the
+            // recomputed value would equal it and neither the write nor the
+            // fanout notification would happen. planPortArms assigns each
+            // such op a bit in the per-model cpu_pflags activity bytes and
+            // records, per operand value, the (word, mask) targets that its
+            // compute-side change publish must arm.
+            bool armableCommitPort(const SimOp &op, const std::vector<OpId> &producerOf) const
+            {
+                const auto name = model_.text(op.opType);
+                if (name != "core.state.regWrite" && name != "core.state.latchWrite") return false;
+                const auto refs = model_.objectRefs(op);
+                const auto operands = model_.operands(op);
+                if (refs.empty() || operands.size() < 3) return false;
+                if (!directCommitStates_[refs.front().index]) return false;
+                for (std::size_t i = 0; i < 3; ++i)
+                {
+                    const auto operand = operands[i];
+                    if (readAliases_[operand.index]) return false;
+                    const auto &operandType = type(operand);
+                    if (operandType.kind != TypeKind::Logic || operandType.domain != LogicDomain::TwoState ||
+                        operandType.width == 0 || operandType.width > 64) return false;
+                    if (layout_.values[operand.index - 1].kind != CpuStorageKind::Boundary) return false;
+                    const auto producerId = producerOf[operand.index];
+                    if (!producerId.index) return false;
+                    const auto producerName = model_.text(model_.operations()[producerId.index - 1].opType);
+                    if (!producerName.starts_with("core.compute.") && producerName != "core.state.read" &&
+                        producerName != "core.state.memRead" && producerName != "core.input.read") return false;
+                }
+                return true;
+            }
+
+            void planPortArms()
+            {
+                portArmWords_.assign(model_.operations().size() + 1, ~std::uint32_t(0));
+                portArmBits_.assign(model_.operations().size() + 1, 0);
+                portArmTargets_.assign(model_.values().size() + 1, {});
+                std::vector<OpId> producerOf(model_.values().size() + 1);
+                for (const auto &op : model_.operations())
+                    for (auto result : model_.results(op)) producerOf[result.index] = op.id;
+                const auto &tree = mapping_.partitionTree;
+                for (const auto &task : schedule_.numaNodes[0].cores[0].tasks)
+                {
+                    if (task.execution == CpuExecution::ActivityDrivenCompute) continue;
+                    std::uint32_t ordinal = 0;
+                    bool any = false;
+                    for (auto unit : tree.partitions[task.partition.index - 1].children)
+                        for (auto opId : tree.partitions[unit.index - 1].ops)
+                        {
+                            const auto &op = model_.operations()[opId.index - 1];
+                            if (!armableCommitPort(op, producerOf)) continue;
+                            any = true;
+                            const std::uint32_t word = portArmWordCount_ + ordinal / 8;
+                            portArmWords_[opId.index] = word;
+                            portArmBits_[opId.index] = static_cast<std::uint8_t>(ordinal % 8);
+                            const auto operands = model_.operands(op);
+                            for (std::size_t i = 0; i < 3; ++i)
+                                portArmTargets_[operands[i].index].push_back({word, std::uint32_t(1u) << (ordinal % 8)});
+                            ++ordinal;
+                        }
+                    if (any) ++portArmTaskCount_;
+                    portArmWordCount_ += (ordinal + 7) / 8;
+                    portArmPortCount_ += ordinal;
+                }
+                for (auto &targets : portArmTargets_)
+                {
+                    if (targets.empty()) continue;
+                    std::map<std::uint32_t, std::uint32_t> merged;
+                    for (const auto target : targets) merged[target.offset] |= target.mask;
+                    std::vector<PortArmTarget> flat;
+                    flat.reserve(merged.size());
+                    for (const auto [offset, mask] : merged) flat.push_back({offset, mask});
+                    targets = std::move(flat);
+                    ++portArmValueCount_;
+                }
+            }
+
+            const std::vector<PortArmTarget> *portArmTargets(ValueId value) const
+            {
+                if (value.index >= portArmTargets_.size() || portArmTargets_[value.index].empty()) return nullptr;
+                return &portArmTargets_[value.index];
+            }
+
+            void armPorts(std::ostream &out, const std::vector<PortArmTarget> &targets, const std::string &condition) const
+            {
+                for (const auto &target : targets)
+                    out << "cpu_pflags[" << target.offset << "] |= (static_cast<std::uint8_t>(-static_cast<std::uint8_t>("
+                        << condition << ")) & " << target.mask << ");\n";
             }
 
             void planSharedHistories()
@@ -1394,8 +1497,13 @@ namespace wolvrix::lib::grhsim
             void computeGroup(std::ostream &out, std::span<const OpId> ops, PartitionId unit,
                               const std::map<uint32_t, std::string> &guards = {}) const
             {
+                struct ChangedGroup
+                {
+                    const CpuActivationTargets *targets = nullptr;
+                    const std::vector<PortArmTarget> *ports = nullptr;
+                };
                 std::map<std::vector<uint32_t>, std::size_t> indices;
-                std::vector<const CpuActivationTargets *> groups;
+                std::vector<ChangedGroup> groups;
                 std::map<uint32_t, std::size_t> groupByValue;
                 for (auto id : ops)
                 {
@@ -1403,14 +1511,26 @@ namespace wolvrix::lib::grhsim
                     const auto results = model_.results(op);
                     if (results.size() != 1 || model_.text(op.opType) == "core.dpi.call") continue;
                     const auto result = results[0];
-                    if (readAliases_[result.index] || !fanout_[result.index] || type(result).kind != TypeKind::Logic) continue;
+                    if (readAliases_[result.index] || type(result).kind != TypeKind::Logic) continue;
                     const auto *targets = fanout_[result.index];
+                    const auto *ports = portArmTargets(result);
+                    if (!targets && !ports) continue;
                     std::vector<uint32_t> key;
-                    for (auto target : targets->activate) key.push_back(target.index);
-                    key.push_back(0);
-                    for (auto target : targets->arm) key.push_back(target.index);
+                    if (targets)
+                    {
+                        for (auto target : targets->activate) key.push_back(target.index);
+                        key.push_back(0);
+                        for (auto target : targets->arm) key.push_back(target.index);
+                    }
+                    key.push_back(~std::uint32_t(0));
+                    if (ports)
+                        for (const auto &target : *ports)
+                        {
+                            key.push_back(target.offset);
+                            key.push_back(target.mask);
+                        }
                     const auto [it, inserted] = indices.emplace(std::move(key), groups.size());
-                    if (inserted) groups.push_back(targets);
+                    if (inserted) groups.push_back({targets, ports});
                     groupByValue.emplace(result.index, it->second);
                 }
                 for (std::size_t i = 0; i < groups.size(); ++i) out << "bool cpu_changed_" << i << "=false;\n";
@@ -1424,7 +1544,10 @@ namespace wolvrix::lib::grhsim
                         guard == guards.end() ? std::string{} : guard->second);
                 }
                 for (std::size_t i = 0; i < groups.size(); ++i)
-                    activate(out, *groups[i], false, unit, "cpu_changed_" + std::to_string(i));
+                {
+                    if (groups[i].targets) activate(out, *groups[i].targets, false, unit, "cpu_changed_" + std::to_string(i));
+                    if (groups[i].ports) armPorts(out, *groups[i].ports, "cpu_changed_" + std::to_string(i));
+                }
             }
 
             void compute(std::ostream &out, const SimOp &op, PartitionId activeUnit, const std::string &changed = {},
@@ -1601,6 +1724,41 @@ namespace wolvrix::lib::grhsim
                     (projected_[target.index] ? "true" : "false") + ")";
             }
 
+            std::string commitEdgeGuard(const SimOp &op, const std::string &cachedGuard = {}) const
+            {
+                const auto operands = model_.operands(op);
+                const auto refs = model_.objectRefs(op);
+                const auto *edges = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
+                std::string guard = model_.text(op.opType) == "core.state.latchWrite" ? "true" : "false";
+                if (edges)
+                    for (std::size_t i = 0; i < edges->size(); ++i)
+                    {
+                        const auto event = value(operands[operands.size() - edges->size() + i]);
+                        const StateId history{refs[i + 1].index, 0};
+                        guard += " || (" + std::string((*edges)[i] == "posedge" ? "!" : "") + state(history) + " && " +
+                                 ((*edges)[i] == "negedge" ? "!" : "") + event + ")";
+                    }
+                if (!cachedGuard.empty()) guard = cachedGuard;
+                return guard;
+            }
+
+            void directCommitBody(std::ostream &out, const SimOp &op) const
+            {
+                const auto operands = model_.operands(op);
+                const StateId target{model_.objectRefs(op)[0].index, 0};
+                const auto range = stateRanges_[target.index];
+                // No commit observer can see this single writer before the next compute phase.
+                out << "// cpu_direct_commit state=" << target.index << "\n"
+                    << "auto &cpu_current=" << state(target) << ";\nconst auto cpu_value="
+                    << normalize("(static_cast<std::uint64_t>(cpu_current)&~static_cast<std::uint64_t>(" + value(operands[2]) +
+                        "))|(static_cast<std::uint64_t>(" + value(operands[1]) + ")&static_cast<std::uint64_t>(" + value(operands[2]) + "))",
+                        stateType(target)) << ";\nif(cpu_current!=cpu_value){cpu_current=cpu_value;\n";
+                if (projected_[target.index] || range.count)
+                    out << "cpu_direct_state_changed(" << range.offset << ',' << range.count << ','
+                        << (projected_[target.index] ? "true" : "false") << ");\n";
+                out << "}\n";
+            }
+
             void commit(std::ostream &out, const SimOp &op, const std::string &cachedGuard = {}) const
             {
                 const auto operands = model_.operands(op); const auto refs = model_.objectRefs(op);
@@ -1691,30 +1849,13 @@ namespace wolvrix::lib::grhsim
                     return;
                 }
                 const auto *edges = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
-                std::string guard = model_.text(op.opType) == "core.state.latchWrite" ? "true" : "false";
-                if (edges)
-                    for (std::size_t i = 0; i < edges->size(); ++i)
-                    {
-                        const auto event = value(operands[operands.size() - edges->size() + i]);
-                        const StateId history{refs[i + 1].index, 0};
-                        guard += " || (" + std::string((*edges)[i] == "posedge" ? "!" : "") + state(history) + " && " +
-                                 ((*edges)[i] == "negedge" ? "!" : "") + event + ")";
-                    }
-                if (!cachedGuard.empty()) guard = cachedGuard;
+                const std::string guard = commitEdgeGuard(op, cachedGuard);
                 out << "if((" << guard << ") && " << value(operands[0]) << "){\n";
                 const StateId target{refs[0].index, 0}; const auto range = stateRanges_[target.index];
                 if (directCommitStates_[target.index])
                 {
-                    // No commit observer can see this single writer before the next compute phase.
-                    out << "// cpu_direct_commit state=" << target.index << "\n"
-                        << "auto &cpu_current=" << state(target) << ";\nconst auto cpu_value="
-                        << normalize("(static_cast<std::uint64_t>(cpu_current)&~static_cast<std::uint64_t>(" + value(operands[2]) +
-                            "))|(static_cast<std::uint64_t>(" + value(operands[1]) + ")&static_cast<std::uint64_t>(" + value(operands[2]) + "))",
-                            stateType(target)) << ";\nif(cpu_current!=cpu_value){cpu_current=cpu_value;\n";
-                    if (projected_[target.index] || range.count)
-                        out << "cpu_direct_state_changed(" << range.offset << ',' << range.count << ','
-                            << (projected_[target.index] ? "true" : "false") << ");\n";
-                    out << "}}\n";
+                    directCommitBody(out, op);
+                    out << "}\n";
                 }
                 else if (isScalarLogic(stateType(target)))
                 {
@@ -1859,6 +2000,7 @@ inline bool cpu_shift_words_changed(const std::uint64_t *value, std::size_t valu
                     << "void cpu_bind_strings();\n"
                     << "std::uint64_t cpu_rng=UINT64_C(0x6a09e667f3bcc909);\n"
                     << "std::array<std::uint8_t," << layout_.runtimeBytes << "> cpu_flags{},cpu_next_arms{};\n"
+                    << "std::array<std::uint8_t," << std::max<std::uint32_t>(portArmWordCount_, 1) << "> cpu_pflags{};\n"
                     << "std::vector<std::uint8_t> cpu_dirty=std::vector<std::uint8_t>(" << dirtyBytes_ << ");\n"
                     << "struct Pending{std::size_t state,offset,size; std::uint32_t begin,count; bool projection;bool memory=false;};\n"
                     << "struct Target{std::uint32_t offset; std::uint8_t mask; bool arm;};\n"
@@ -1936,7 +2078,7 @@ inline bool cpu_shift_words_changed(const std::uint64_t *value, std::size_t valu
                     out << "cpu_at<std::string*>(" << persistentStrings_[i].first << ',' << persistentStrings_[i].second
                         << ")=&cpu_strings[" << i << "];\n";
                 out << "}\nvoid " << class_ << "::init(){\nstd::memset(cpu_objects.get(),0," << layout_.objectBytes << ");\nstd::memset(cpu_boundary.get(),0," << layout_.boundaryBytes << ");\n"
-                    << "cpu_inputs.fill(std::byte{});cpu_flags.fill(0);cpu_next_arms.fill(0);std::fill(cpu_dirty.begin(),cpu_dirty.end(),0);cpu_pending.clear();cpu_direct_again=false;cpu_read_offsets.fill(0);\n";
+                    << "cpu_inputs.fill(std::byte{});cpu_flags.fill(0);cpu_next_arms.fill(0);cpu_pflags.fill(255);std::fill(cpu_dirty.begin(),cpu_dirty.end(),0);cpu_pending.clear();cpu_direct_again=false;cpu_read_offsets.fill(0);\n";
                 out << "for(std::size_t i=0;i<" << persistentStrings_.size() << ";++i)cpu_strings[i].clear();\ncpu_bind_strings();\n";
                 out << "cpu_profile_data={};\n";
                 out << "cpu_rng=UINT64_C(0x6a09e667f3bcc909);\n";
@@ -2266,12 +2408,53 @@ if(terminal){
                         out << "return;}\n";
                     }
                     const auto guards = commitEdgeSnapshots(out, task);
+                    const auto findGuard = [&](OpId id) {
+                        const auto found = guards.find(id.index);
+                        return found == guards.end() ? std::string{} : found->second;
+                    };
+                    // Event sampling stays unconditional in original op order
+                    // (shared histories overwrite in program order); only the
+                    // armed write ports move into the change-gated groups.
+                    bool anyArmed = false;
                     for (auto unit : tree.partitions[task.partition.index - 1].children)
                         for (auto op : tree.partitions[unit.index - 1].ops)
                         {
-                            const auto guard = guards.find(op.index);
-                            commit(out, model_.operations()[op.index - 1], guard == guards.end() ? std::string{} : guard->second);
+                            if (portArmWords_[op.index] != ~std::uint32_t(0))
+                            {
+                                anyArmed = true;
+                                sampleEvents(out, model_.operations()[op.index - 1], 1);
+                            }
+                            else commit(out, model_.operations()[op.index - 1], findGuard(op));
                         }
+                    // A port is evaluated only when one of its boundary
+                    // operands changed since its last evaluation (its arm bit
+                    // is set). Bits are consumed only for ports whose edge
+                    // guard actually fires here; unarmed ports provably end
+                    // in current==value, so state updates and notifications
+                    // are unchanged.
+                    std::uint32_t openWord = ~std::uint32_t(0);
+                    if (anyArmed)
+                        for (auto unit : tree.partitions[task.partition.index - 1].children)
+                            for (auto op : tree.partitions[unit.index - 1].ops)
+                            {
+                                const auto word = portArmWords_[op.index];
+                                if (word == ~std::uint32_t(0)) continue;
+                                const auto &operation = model_.operations()[op.index - 1];
+                                if (word != openWord)
+                                {
+                                    if (openWord != ~std::uint32_t(0))
+                                        out << "cpu_pflags[" << openWord << "]&=~cpu_consumed;}}\n";
+                                    out << "{const std::uint8_t cpu_armed=cpu_pflags[" << word << "];if(cpu_armed){std::uint8_t cpu_consumed=0;\n";
+                                    openWord = word;
+                                }
+                                const auto bit = 1u << portArmBits_[op.index];
+                                out << "if(cpu_armed&" << bit << "){if(" << commitEdgeGuard(operation, findGuard(op)) << "){cpu_consumed|="
+                                    << bit << ";if(" << value(model_.operands(operation)[0]) << "){\n";
+                                directCommitBody(out, operation);
+                                out << "}}}\n";
+                            }
+                    if (openWord != ~std::uint32_t(0))
+                        out << "cpu_pflags[" << openWord << "]&=~cpu_consumed;}}\n";
                     // Private shadow writes commute; guards keep reading individual visible histories.
                     if (const auto batches = historyBatches_.find(task.id.index); batches != historyBatches_.end())
                         for (const auto &batch : batches->second) sampleHistoryBatch(out, batch);
@@ -2380,6 +2563,11 @@ if(terminal){
             std::map<uint32_t, std::vector<HistoryBatch>> historyBatches_;
             uint64_t historyCandidates_ = 0, historyPrivateRejected_ = 0, historyLayoutRejected_ = 0;
             uint64_t historyBatchStates_ = 0, historyBatchCount_ = 0, historyMaxBatch_ = 0, historyMaxPattern_ = 0;
+            std::vector<std::uint32_t> portArmWords_;
+            std::vector<std::uint8_t> portArmBits_;
+            std::vector<std::vector<PortArmTarget>> portArmTargets_;
+            std::uint32_t portArmWordCount_ = 0;
+            std::uint64_t portArmPortCount_ = 0, portArmTaskCount_ = 0, portArmValueCount_ = 0;
         };
 
         class EmitCppPass final : public Pass

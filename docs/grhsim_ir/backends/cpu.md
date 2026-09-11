@@ -527,6 +527,36 @@ direct commit 不改变 phase/task/domain/event 策略，也不影响 DPI 真实
 覆盖 signed 5-bit、unsigned 64-bit、bool、零/部分/全 mask、重复 eval 和 init。
 生成标记还检查多写者及普通写口写 history 的回退，防止提前记录中间变化。
 
+### CPU C++ 提交端口变化武装
+
+满足以下条件的 direct-commit 写口（regWrite/latchWrite）按变化武装（change-armed）：
+enable/data/mask 三个操作数都是 boundary 存储的 2-state 1..64-bit logic，不是
+state.read 别名，且生产者仅限 `core.compute.*`、`core.state.read`、`core.state.memRead`
+（这些写站点都经过 computeGroup 的变化发布路径）。每个 task 内合格写口按 op 顺序
+编号，每 8 个组成一个 `cpu_pflags` 活动字节；`init()` 全部置 1，首轮必做完整求值。
+
+机制依据：写口目标状态只有唯一写者（direct commit 前提），两次求值之间 `current`
+不变；操作数是 boundary 持久值，只随 compute 的变化发布改写。因此若某个边沿求值时
+全部操作数与上次求值相同，则 `(current&~mask)|(data&mask)` 的重算结果必然等于
+`current`，写入与 `cpu_direct_state_changed` 通知都不会发生，跳过求值不可观察。
+常数操作数（如常量 enable）的写站点从不产生变化事件，相应端口在首轮后不再被武装，
+同样安全。
+
+武装端在 compute 侧：`computeGroup` 的分组键加入端口武装签名，使带端口目标的 value
+即使原无 fanout 也获得 `cpu_changed` 比较；组尾在原 fanout 激活之外追加
+`cpu_pflags[word] |= -changed & mask`。常量操作数没有写站点，天然不武装。
+
+消费端在 commit 任务的 main path：事件采样仍按原 op 顺序无条件发射（共享 history
+的覆盖顺序不变），合格写口的写块移到按 `cpu_pflags` 字节分组的武装段，位于其他
+写口之后；不同写口的目标状态互不相交、boundary 在 commit 期间稳定，该重排不
+改变任何状态内容。每个端口仅在武装位置位时求值，且仅当其边沿守卫（共享快照或
+内联边沿表达式，latch 为 true）成立才消费该位：边沿未触发时保留武装位到下一次
+执行。stable-history 整任务跳过与 inactive-edge 采样路径不消费武装位。被跳过的
+端口状态更新、pending 记录与轮次收敛结构（`again`/E）与原语义逐位一致。
+
+武装位持续直到被消费，跨 round、跨 eval 有效；同一 eval 内 compute 的新变化在
+下一轮重新武装。发射器诊断给出 `port_arm_ports/tasks/values/words`。
+
 ### CPU C++ 宽位运算活动度
 
 compute word 调度沿用 legacy 局部活动字节结构：读取 `cpu_flags[wordOffset]` 到
